@@ -33,32 +33,42 @@ jobs:
       CG_APP: commandergenius
     steps:
       - name: Checkout (tu repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Dependencias del sistema
+      - name: Clonar distro Android de Commander Genius (solo submodulos necesarios)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git ant make python3 unzip
-
-      - name: Clonar distro Android de Commander Genius
-        run: |
-          git clone --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
+          # El runner no puede usar git:// (puerto 9418): forzar https
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git clone --depth 1 --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
           cd cg
-          git submodule update --init --recursive
-          ls project/jni/application | head -50
-          test -d "project/jni/application/$CG_APP" || { echo "No existe project/jni/application/$CG_APP"; exit 1; }
+          CFG="project/jni/application/$CG_APP/AndroidAppSettings.cfg"
+          test -f "$CFG" || { echo "No existe $CFG"; ls project/jni/application | head -50; exit 1; }
+          LIBS="$(grep -E '^CompiledLibraries=' "$CFG" | sed 's/^CompiledLibraries=//; s/"//g')"
+          echo "CompiledLibraries: $LIBS"
+          SUBS="$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}')"
+          PATHS="project/jni/application/$CG_APP/$CG_APP project/jni/sdl2 project/jni/sdl2_image project/jni/sdl2_mixer project/jni/sdl2_ttf"
+          for L in $LIBS; do
+            for M in $(echo "$SUBS" | grep -E "^project/jni/$L(/|$)" || true); do
+              PATHS="$PATHS $M"
+            done
+          done
+          PATHS="$(echo $PATHS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+          echo "Submodulos a descargar: $PATHS"
+          git submodule update --init --recursive --depth 1 -- $PATHS \
+            || git submodule update --init --recursive -- $PATHS
+          test -d "project/jni/application/$CG_APP/$CG_APP" || { echo "Falta el codigo de Commander Genius"; exit 1; }
 
       - name: Licencias del SDK y PATH del NDK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           ln -sfn "$ANDROID_HOME/licenses" cg/project/licenses || true
-          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
           echo "NDK usado: $NDK"
           echo "$NDK" >> "$GITHUB_PATH"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
@@ -605,15 +615,22 @@ jobs:
       - name: Compilar APK
         working-directory: cg
         run: |
+          touch "$RUNNER_TEMP/antes_de_compilar"
           ./build.sh debug
+
+      - name: Reunir APKs nuevos
+        run: |
+          # build.sh puede dejar el APK en la raiz de cg (app-debug.apk / app-release.apk)
+          # o dentro de project/: se recoge cualquier APK creado o modificado en esta compilacion
+          mkdir -p salida
+          find cg -name '*.apk' -newer "$RUNNER_TEMP/antes_de_compilar" -not -path '*/hid-pc-keyboard/*' -exec cp -v {} salida/ \;
+          ls -la salida
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
           name: commander-keen-apk
-          path: |
-            cg/project/**/*.apk
-            cg/**/MainActivity-*.apk
+          path: salida/*.apk
           if-no-files-found: error
 
       - name: Diagnostico (solo si falla)
@@ -623,5 +640,7 @@ jobs:
           echo "=== NDK ==="; echo "$ANDROID_NDK_HOME"; ls "$ANDROID_HOME/ndk" || true
           echo "=== Manifests ==="; find project -maxdepth 3 -name AndroidManifest.xml -not -path '*/build/*'
           echo "=== ImportActivity ==="; find project -name ImportActivity.java
+          echo "=== Submodulos descargados ==="; git submodule status | grep -v '^-' | head -30
+          echo "=== App CG ==="; ls -la "project/jni/application/$CG_APP" || true
           echo "=== APKs ==="; find . -name '*.apk' | head
           echo "=== build.sh ==="; sed -n '1,60p' build.sh
