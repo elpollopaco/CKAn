@@ -78,7 +78,9 @@ jobs:
         run: |
           rm -f project/jni/application/src
           ln -s "$CG_APP" project/jni/application/src
-          cp "project/jni/application/$CG_APP/AndroidAppSettings.cfg" ./AndroidAppSettings.cfg
+          # En la raiz, AndroidAppSettings.cfg ya es un enlace simbolico a la app: apuntarlo a CG_APP
+          rm -f ./AndroidAppSettings.cfg
+          ln -s "project/jni/application/$CG_APP/AndroidAppSettings.cfg" ./AndroidAppSettings.cfg
           if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
             cp "$GITHUB_WORKSPACE/icon.png" project/jni/application/src/icon.png
             echo "icon.png propio aplicado"
