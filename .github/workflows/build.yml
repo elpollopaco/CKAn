@@ -1,0 +1,627 @@
+# =============================================================================
+# Commander Keen (1-6, Dreams, Keen 7 mod) para Android - build.yml unico
+#
+# Colocar en: .github/workflows/build.yml
+# Colocar tambien: icon.png en la raiz del repo (icono propio de la app)
+#
+# Que hace:
+#   1. Clona la distro Android de Commander Genius (pelya/commandergenius)
+#   2. Copia tu icon.png en la raiz del repo como icono de la app
+#   3. Inyecta ImportActivity (pantalla inicial que pide el ZIP):
+#        - verifica el SHA-256 hardcodeado (EXPECTED_SHA256 abajo)
+#        - copia los juegos a la carpeta "games" de la app
+#        - Commander Genius detecta esas carpetas y las muestra en la coleccion
+#        - despues puedes borrar el ZIP y las carpetas originales
+#   4. Compila y sube el APK como artefacto
+#
+# NOTA: no se ha podido probar la compilacion; si falla, el paso final
+# "Diagnostico" imprime la informacion necesaria para corregirlo.
+# =============================================================================
+name: Build Commander Keen APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CG_BRANCH: sdl_android
+      CG_APP: commandergenius
+    steps:
+      - name: Checkout (tu repo)
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git ant make python3 unzip
+
+      - name: Clonar distro Android de Commander Genius
+        run: |
+          git clone --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
+          cd cg
+          git submodule update --init --recursive
+          ls project/jni/application | head -50
+          test -d "project/jni/application/$CG_APP" || { echo "No existe project/jni/application/$CG_APP"; exit 1; }
+
+      - name: Licencias del SDK y PATH del NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          ln -sfn "$ANDROID_HOME/licenses" cg/project/licenses || true
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK usado: $NDK"
+          echo "$NDK" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Seleccionar app y aplicar icon.png propio
+        working-directory: cg
+        run: |
+          rm -f project/jni/application/src
+          ln -s "$CG_APP" project/jni/application/src
+          cp "project/jni/application/$CG_APP/AndroidAppSettings.cfg" ./AndroidAppSettings.cfg
+          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
+            cp "$GITHUB_WORKSPACE/icon.png" project/jni/application/src/icon.png
+            echo "icon.png propio aplicado"
+          else
+            echo "AVISO: no hay icon.png en la raiz del repo; se usa el icono por defecto"
+          fi
+          ./changeAppSettings.sh -a
+
+      - name: Inyectar ImportActivity (ZIP verificado) y manifest
+        working-directory: cg
+        run: |
+          set -e
+          MAIN_JAVA="$(find project -name MainActivity.java | head -n1)"
+          test -n "$MAIN_JAVA" || { echo "No se encontro MainActivity.java"; exit 1; }
+          JAVA_DIR="$(dirname "$MAIN_JAVA")"
+          PKG="$(grep -m1 '^package ' "$MAIN_JAVA" | sed 's/^package //; s/;.*//' | tr -d '\r ')"
+          echo "MainActivity: $MAIN_JAVA"
+          echo "Paquete: $PKG"
+
+          cat > "$JAVA_DIR/ImportActivity.java" <<'JAVA_EOF'
+          package __PKG__;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.ActivityInfo;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.OpenableColumns;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
+
+          import java.io.BufferedInputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.FilterInputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.security.MessageDigest;
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipInputStream;
+
+          public class ImportActivity extends Activity {
+
+              // ===================== CONFIGURACION HARDCODEADA =====================
+              private static final String EXPECTED_SHA256 =
+                      "163f6742469a6ce9ec9e1f28a22cfcc377127ac276c3431555727ff693ba769e";
+              private static final String GAMES_SUBDIR = "games";
+              private static final String MARKER_FILE = "keen_zip_import.txt";
+              private static final String TMP_DIR = "keen_import_tmp";
+              private static final long MAX_EXTRACT_BYTES = 1024L * 1024L * 1024L;
+              private static final int REQ_PICK = 4242;
+              // =====================================================================
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private TextView status;
+              private ProgressBar bar;
+              private Button pick;
+              private boolean working = false;
+              private long lastPost = 0;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  File base = getExternalFilesDir(null);
+                  if (base != null && alreadyImported(base)) {
+                      launchGame();
+                      return;
+                  }
+                  buildUi();
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER);
+                  int pad = (int) (24 * getResources().getDisplayMetrics().density);
+                  root.setPadding(pad, pad, pad, pad);
+
+                  TextView title = new TextView(this);
+                  title.setText("Commander Keen");
+                  title.setTextSize(26);
+                  title.setGravity(Gravity.CENTER);
+
+                  TextView info = new TextView(this);
+                  info.setText("Selecciona el ZIP con los juegos. Se verificará y se copiará a la app; "
+                          + "después ya no necesitarás el ZIP.");
+                  info.setGravity(Gravity.CENTER);
+                  info.setPadding(0, pad, 0, pad);
+
+                  pick = new Button(this);
+                  pick.setText("Seleccionar ZIP");
+                  pick.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          pickZip();
+                      }
+                  });
+
+                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  bar.setMax(1000);
+
+                  status = new TextView(this);
+                  status.setGravity(Gravity.CENTER);
+                  status.setPadding(0, pad, 0, 0);
+
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  root.addView(title, lp);
+                  root.addView(info, lp);
+                  root.addView(pick, lp);
+                  root.addView(bar, lp);
+                  root.addView(status, lp);
+                  setContentView(root);
+              }
+
+              private void pickZip() {
+                  if (working) return;
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("*/*");
+                  i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                          "application/zip", "application/x-zip-compressed", "application/octet-stream"
+                  });
+                  startActivityForResult(i, REQ_PICK);
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == REQ_PICK && res == RESULT_OK && data != null && data.getData() != null) {
+                      startImport(data.getData());
+                  }
+              }
+
+              private void startImport(final Uri uri) {
+                  if (working) return;
+                  working = true;
+                  pick.setEnabled(false);
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          File tmp = null;
+                          try {
+                              File base = getExternalFilesDir(null);
+                              if (base == null) throw new IOException("Almacenamiento de la app no disponible");
+                              long total = querySize(uri);
+
+                              String got = sha256(uri, total);
+                              if (!got.equalsIgnoreCase(EXPECTED_SHA256)) {
+                                  fail("El ZIP no coincide con el esperado.\nSHA-256 obtenido:\n" + got);
+                                  return;
+                              }
+
+                              tmp = new File(base, TMP_DIR);
+                              deleteRec(tmp);
+                              tmp.mkdirs();
+                              extract(uri, tmp, total);
+
+                              progress("Añadiendo juegos a la colección...", 1, 1);
+                              int n = installGames(tmp, new File(base, GAMES_SUBDIR));
+                              deleteRec(tmp);
+                              if (n == 0) {
+                                  fail("No se encontraron juegos dentro del ZIP.");
+                                  return;
+                              }
+                              writeText(new File(base, MARKER_FILE), EXPECTED_SHA256);
+                              done(n);
+                          } catch (Throwable t) {
+                              if (tmp != null) deleteRec(tmp);
+                              fail("Error: " + t.getMessage());
+                          }
+                      }
+                  }).start();
+              }
+
+              // ----------------------------- UI helpers --------------------------
+              private void progress(final String text, final long done, final long total) {
+                  long now = System.currentTimeMillis();
+                  if (now - lastPost < 120 && done < total) return;
+                  lastPost = now;
+                  final int p = total > 0 ? (int) Math.min(1000L, done * 1000L / total) : 0;
+                  final boolean indet = total <= 0;
+                  ui.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          status.setText(text);
+                          bar.setIndeterminate(indet);
+                          if (!indet) bar.setProgress(p);
+                      }
+                  });
+              }
+
+              private void fail(final String msg) {
+                  ui.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          working = false;
+                          bar.setIndeterminate(false);
+                          bar.setProgress(0);
+                          status.setText(msg);
+                          pick.setEnabled(true);
+                      }
+                  });
+              }
+
+              private void done(final int n) {
+                  ui.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          bar.setIndeterminate(false);
+                          bar.setProgress(1000);
+                          status.setText("Listo: " + n + " juego(s) añadidos a la colección.");
+                      }
+                  });
+                  ui.postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          launchGame();
+                      }
+                  }, 900);
+              }
+
+              private void launchGame() {
+                  try {
+                      PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(),
+                              PackageManager.GET_ACTIVITIES);
+                      String target = null;
+                      if (pi.activities != null) {
+                          for (ActivityInfo ai : pi.activities) {
+                              if (ai.name != null && ai.name.endsWith("MainActivity")) {
+                                  target = ai.name;
+                                  break;
+                              }
+                          }
+                      }
+                      if (target == null) throw new Exception("MainActivity no encontrada");
+                      Intent i = new Intent();
+                      i.setClassName(getPackageName(), target);
+                      startActivity(i);
+                      finish();
+                  } catch (Exception e) {
+                      if (status != null) status.setText("No se pudo iniciar el juego: " + e.getMessage());
+                  }
+              }
+
+              // ----------------------------- Logica de ZIP -----------------------
+              private boolean alreadyImported(File base) {
+                  try {
+                      File m = new File(base, MARKER_FILE);
+                      if (!m.isFile()) return false;
+                      if (!readText(m).trim().equalsIgnoreCase(EXPECTED_SHA256)) return false;
+                      File games = new File(base, GAMES_SUBDIR);
+                      File[] fs = games.listFiles();
+                      if (fs == null) return false;
+                      for (File f : fs) if (f.isDirectory()) return true;
+                      return false;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              private long querySize(Uri uri) {
+                  Cursor c = null;
+                  try {
+                      c = getContentResolver().query(uri, new String[] { OpenableColumns.SIZE }, null, null, null);
+                      if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
+                  } catch (Exception e) {
+                      // sin tamaño: barra indeterminada
+                  } finally {
+                      if (c != null) c.close();
+                  }
+                  return -1;
+              }
+
+              private String sha256(Uri uri, long total) throws Exception {
+                  MessageDigest md = MessageDigest.getInstance("SHA-256");
+                  InputStream in = getContentResolver().openInputStream(uri);
+                  if (in == null) throw new IOException("No se pudo abrir el archivo");
+                  try {
+                      byte[] buf = new byte[65536];
+                      long done = 0;
+                      int n;
+                      while ((n = in.read(buf)) != -1) {
+                          md.update(buf, 0, n);
+                          done += n;
+                          progress("Verificando ZIP...", done, total);
+                      }
+                  } finally {
+                      in.close();
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  for (byte x : md.digest()) sb.append(String.format(Locale.ROOT, "%02x", x));
+                  return sb.toString();
+              }
+
+              private static class CountingIn extends FilterInputStream {
+                  long count = 0;
+
+                  CountingIn(InputStream in) {
+                      super(in);
+                  }
+
+                  @Override
+                  public int read() throws IOException {
+                      int b = super.read();
+                      if (b >= 0) count++;
+                      return b;
+                  }
+
+                  @Override
+                  public int read(byte[] b, int o, int l) throws IOException {
+                      int n = super.read(b, o, l);
+                      if (n > 0) count += n;
+                      return n;
+                  }
+              }
+
+              private void extract(Uri uri, File dest, long total) throws Exception {
+                  InputStream raw = getContentResolver().openInputStream(uri);
+                  if (raw == null) throw new IOException("No se pudo abrir el archivo");
+                  CountingIn cin = new CountingIn(raw);
+                  ZipInputStream zin = new ZipInputStream(new BufferedInputStream(cin, 65536));
+                  String root = dest.getCanonicalPath() + File.separator;
+                  byte[] buf = new byte[65536];
+                  long written = 0;
+                  try {
+                      ZipEntry e;
+                      while ((e = zin.getNextEntry()) != null) {
+                          String name = e.getName().replace('\\', '/');
+                          while (name.startsWith("/")) name = name.substring(1);
+                          if (name.length() == 0 || name.startsWith("__MACOSX/") || name.contains("/__MACOSX/")) {
+                              continue;
+                          }
+                          File out = new File(dest, name);
+                          if (!out.getCanonicalPath().startsWith(root)) {
+                              throw new IOException("Ruta inválida en el ZIP: " + name);
+                          }
+                          if (e.isDirectory() || name.endsWith("/")) {
+                              out.mkdirs();
+                              continue;
+                          }
+                          File parent = out.getParentFile();
+                          if (parent != null) parent.mkdirs();
+                          OutputStream os = new FileOutputStream(out);
+                          try {
+                              int n;
+                              while ((n = zin.read(buf)) != -1) {
+                                  written += n;
+                                  if (written > MAX_EXTRACT_BYTES) {
+                                      throw new IOException("El ZIP descomprimido es demasiado grande");
+                                  }
+                                  os.write(buf, 0, n);
+                                  progress("Copiando juegos...", cin.count, total);
+                              }
+                          } finally {
+                              os.close();
+                          }
+                      }
+                  } finally {
+                      zin.close();
+                  }
+              }
+
+              private boolean hasExe(File dir) {
+                  File[] fs = dir.listFiles();
+                  if (fs == null) return false;
+                  for (File f : fs) {
+                      if (f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".exe")) return true;
+                  }
+                  return false;
+              }
+
+              private void findGameDirs(File dir, List<File> out) {
+                  if (hasExe(dir)) {
+                      out.add(dir);
+                      return;
+                  }
+                  File[] fs = dir.listFiles();
+                  if (fs == null) return;
+                  for (File f : fs) if (f.isDirectory()) findGameDirs(f, out);
+              }
+
+              private int installGames(File tmp, File games) throws IOException {
+                  List<File> found = new ArrayList<File>();
+                  findGameDirs(tmp, found);
+                  if (found.isEmpty()) {
+                      File[] top = tmp.listFiles();
+                      if (top != null) for (File f : top) if (f.isDirectory()) found.add(f);
+                  }
+                  if (found.isEmpty()) return 0;
+                  games.mkdirs();
+                  Set<String> used = new HashSet<String>();
+                  int n = 0;
+                  for (File d : found) {
+                      String name = d.equals(tmp) ? "Keen" : d.getName();
+                      String unique = name;
+                      int k = 2;
+                      while (used.contains(unique.toLowerCase(Locale.ROOT))) unique = name + "_" + (k++);
+                      used.add(unique.toLowerCase(Locale.ROOT));
+                      File dest = new File(games, unique);
+                      deleteRec(dest);
+                      if (!d.renameTo(dest)) {
+                          copyRec(d, dest);
+                          deleteRec(d);
+                      }
+                      n++;
+                  }
+                  return n;
+              }
+
+              private static void deleteRec(File f) {
+                  if (f == null || !f.exists()) return;
+                  File[] fs = f.listFiles();
+                  if (fs != null) for (File c : fs) deleteRec(c);
+                  f.delete();
+              }
+
+              private static void copyRec(File src, File dst) throws IOException {
+                  if (src.isDirectory()) {
+                      dst.mkdirs();
+                      File[] fs = src.listFiles();
+                      if (fs != null) for (File c : fs) copyRec(c, new File(dst, c.getName()));
+                      return;
+                  }
+                  InputStream in = new FileInputStream(src);
+                  try {
+                      OutputStream os = new FileOutputStream(dst);
+                      try {
+                          byte[] buf = new byte[65536];
+                          int n;
+                          while ((n = in.read(buf)) != -1) os.write(buf, 0, n);
+                      } finally {
+                          os.close();
+                      }
+                  } finally {
+                      in.close();
+                  }
+              }
+
+              private static void writeText(File f, String s) throws IOException {
+                  OutputStream os = new FileOutputStream(f);
+                  try {
+                      os.write(s.getBytes("UTF-8"));
+                  } finally {
+                      os.close();
+                  }
+              }
+
+              private static String readText(File f) throws IOException {
+                  InputStream in = new FileInputStream(f);
+                  try {
+                      byte[] buf = new byte[512];
+                      int n = in.read(buf);
+                      return n > 0 ? new String(buf, 0, n, "UTF-8") : "";
+                  } finally {
+                      in.close();
+                  }
+              }
+          }
+          JAVA_EOF
+
+          sed -i "s/__PKG__/$PKG/" "$JAVA_DIR/ImportActivity.java"
+
+          cat > patch_manifest.py <<'PY_EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          ANDROID = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", ANDROID)
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+
+
+          def a(n):
+              return "{%s}%s" % (ANDROID, n)
+
+
+          path, pkg = sys.argv[1], sys.argv[2]
+          tree = ET.parse(path)
+          root = tree.getroot()
+          app = root.find("application")
+          if app is None:
+              sys.exit("No hay <application> en " + path)
+
+          main = None
+          for act in app.findall("activity"):
+              if act.get(a("name"), "").endswith("MainActivity"):
+                  main = act
+          if main is None:
+              sys.exit("MainActivity no encontrada en el manifest")
+
+          for f in list(main.findall("intent-filter")):
+              names = [x.get(a("name")) for x in f.findall("action")]
+              if "android.intent.action.MAIN" in names:
+                  main.remove(f)
+
+          if not any(x.get(a("name")) == pkg + ".ImportActivity" for x in app.findall("activity")):
+              imp = ET.SubElement(app, "activity")
+              imp.set(a("name"), pkg + ".ImportActivity")
+              imp.set(a("exported"), "true")
+              imp.set(a("theme"), "@android:style/Theme.DeviceDefault.NoActionBar")
+              imp.set(a("configChanges"), "orientation|screenSize|keyboardHidden")
+              f = ET.SubElement(imp, "intent-filter")
+              ET.SubElement(f, "action").set(a("name"), "android.intent.action.MAIN")
+              ET.SubElement(f, "category").set(a("name"), "android.intent.category.LAUNCHER")
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          print("Manifest parcheado:", path)
+          PY_EOF
+
+          MANIFESTS="$(find project -maxdepth 3 -name AndroidManifest.xml -not -path '*/build/*')"
+          echo "Manifests encontrados:"; echo "$MANIFESTS"
+          for M in $MANIFESTS; do
+            if grep -q 'MainActivity' "$M"; then
+              python3 patch_manifest.py "$M" "$PKG"
+            fi
+          done
+
+      - name: Compilar APK
+        working-directory: cg
+        run: |
+          ./build.sh debug
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: commander-keen-apk
+          path: |
+            cg/project/**/*.apk
+            cg/**/MainActivity-*.apk
+          if-no-files-found: error
+
+      - name: Diagnostico (solo si falla)
+        if: failure()
+        working-directory: cg
+        run: |
+          echo "=== NDK ==="; echo "$ANDROID_NDK_HOME"; ls "$ANDROID_HOME/ndk" || true
+          echo "=== Manifests ==="; find project -maxdepth 3 -name AndroidManifest.xml -not -path '*/build/*'
+          echo "=== ImportActivity ==="; find project -name ImportActivity.java
+          echo "=== APKs ==="; find . -name '*.apk' | head
+          echo "=== build.sh ==="; sed -n '1,60p' build.sh
