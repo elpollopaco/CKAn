@@ -5,17 +5,21 @@
 # Colocar tambien: icon.png en la raiz del repo (icono propio de la app)
 #
 # Que hace:
-#   1. Clona la distro Android de Commander Genius (pelya/commandergenius)
-#   2. Copia tu icon.png en la raiz del repo como icono de la app
-#   3. Inyecta ImportActivity (pantalla inicial que pide el ZIP):
-#        - verifica el SHA-256 hardcodeado (EXPECTED_SHA256 abajo)
-#        - copia los juegos a la carpeta "games" de la app
-#        - Commander Genius detecta esas carpetas y las muestra en la coleccion
-#        - despues puedes borrar el ZIP y las carpetas originales
-#   4. Compila y sube el APK como artefacto
+#   1. Clona la distro Android de Commander Genius (pelya/commandergenius),
+#      SIN descargar las apps ajenas (Teeworlds, OpenTTD...) que daban timeout.
+#   2. Instala un "inyector": envuelve changeAppSettings.sh para que, cada vez
+#      que la distro regenere el proyecto, se vuelva a aplicar:
+#        - ImportActivity (pantalla inicial que pide el ZIP de los juegos):
+#            * verifica el SHA-256 hardcodeado (EXPECTED_SHA256 en el Java)
+#            * copia los juegos a files/games de la app (Commander Genius los
+#              detecta solo y los muestra en la coleccion); luego puedes borrar
+#              el ZIP y las carpetas originales
+#        - parche del manifest (ImportActivity como pantalla de inicio)
+#        - tu icon.png de la raiz del repo como icono
+#   3. Compila, firma (clave debug si hace falta) y VERIFICA que el APK
+#      contiene ImportActivity antes de subirlo como artefacto.
 #
-# NOTA: no se ha podido probar la compilacion; si falla, el paso final
-# "Diagnostico" imprime la informacion necesaria para corregirlo.
+# Si algo falla, el ultimo paso imprime un diagnostico completo.
 # =============================================================================
 name: Build Commander Keen APK
 
@@ -27,7 +31,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       CG_BRANCH: sdl_android
       CG_APP: commandergenius
@@ -41,66 +45,56 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Clonar distro Android de Commander Genius (solo submodulos necesarios)
+      - name: Clonar distro (sin las apps ajenas)
         run: |
+          set -euo pipefail
           # El runner no puede usar git:// (puerto 9418): forzar https
           git config --global url."https://github.com/".insteadOf "git://github.com/"
-          git clone --depth 1 --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
+          git clone --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
           cd cg
-          CFG="project/jni/application/$CG_APP/AndroidAppSettings.cfg"
-          test -f "$CFG" || { echo "No existe $CFG"; ls project/jni/application | head -50; exit 1; }
-          LIBS="$(grep -E '^CompiledLibraries=' "$CFG" | sed 's/^CompiledLibraries=//; s/"//g')"
-          echo "CompiledLibraries: $LIBS"
-          SUBS="$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}')"
-          PATHS="project/jni/application/$CG_APP/$CG_APP project/jni/sdl2 project/jni/sdl2_image project/jni/sdl2_mixer project/jni/sdl2_ttf"
-          for L in $LIBS; do
-            for M in $(echo "$SUBS" | grep -E "^project/jni/$L(/|$)" || true); do
-              PATHS="$PATHS $M"
-            done
+          # No descargar los submodulos de otras apps (Teeworlds, OpenTTD, etc.)
+          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | while read -r key path; do
+            name="${key#submodule.}"; name="${name%.path}"
+            case "$path" in
+              "project/jni/application/$CG_APP"/*) echo "descargar: $path" ;;
+              project/jni/application/*) git config "submodule.$name.update" none; echo "omitir:    $path" ;;
+              *) echo "descargar: $path" ;;
+            esac
           done
-          PATHS="$(echo $PATHS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
-          echo "Submodulos a descargar: $PATHS"
-          git submodule update --init --recursive --depth 1 -- $PATHS \
-            || git submodule update --init --recursive -- $PATHS
-          test -d "project/jni/application/$CG_APP/$CG_APP" || { echo "Falta el codigo de Commander Genius"; exit 1; }
+          git submodule update --init --recursive --jobs 4
+          test -f "project/jni/application/$CG_APP/AndroidAppSettings.cfg" || { echo "Falta el cfg de $CG_APP"; ls project/jni/application; exit 1; }
+          test -d "project/jni/application/$CG_APP/commandergenius" || { echo "Falta el codigo de Commander Genius"; exit 1; }
 
-      - name: Licencias del SDK y PATH del NDK
+      - name: Entorno Android (licencias, NDK, clave debug)
         run: |
+          set -euo pipefail
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          ln -sfn "$ANDROID_HOME/licenses" cg/project/licenses || true
-          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          ln -sfn "$ANDROID_HOME/licenses" cg/project/licenses
+          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then echo "No hay NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; fi
           echo "NDK usado: $NDK"
           echo "$NDK" >> "$GITHUB_PATH"
-          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-
-      - name: Seleccionar app y aplicar icon.png propio
-        working-directory: cg
-        run: |
-          rm -f project/jni/application/src
-          ln -s "$CG_APP" project/jni/application/src
-          # En la raiz, AndroidAppSettings.cfg ya es un enlace simbolico a la app: apuntarlo a CG_APP
-          rm -f ./AndroidAppSettings.cfg
-          ln -s "project/jni/application/$CG_APP/AndroidAppSettings.cfg" ./AndroidAppSettings.cfg
-          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
-            cp "$GITHUB_WORKSPACE/icon.png" project/jni/application/src/icon.png
-            echo "icon.png propio aplicado"
-          else
-            echo "AVISO: no hay icon.png en la raiz del repo; se usa el icono por defecto"
+          {
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
+            echo "KEEN_TOOLS=$GITHUB_WORKSPACE/keen_tools"
+            echo "KEEN_CG=$GITHUB_WORKSPACE/cg"
+          } >> "$GITHUB_ENV"
+          # Clave debug (algunos scripts de la distro la esperan en ~/.android)
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
           fi
-          ./changeAppSettings.sh -a
 
-      - name: Inyectar ImportActivity (ZIP verificado) y manifest
-        working-directory: cg
+      - name: Herramientas del inyector
         run: |
-          set -e
-          MAIN_JAVA="$(find project -name MainActivity.java | head -n1)"
-          test -n "$MAIN_JAVA" || { echo "No se encontro MainActivity.java"; exit 1; }
-          JAVA_DIR="$(dirname "$MAIN_JAVA")"
-          PKG="$(grep -m1 '^package ' "$MAIN_JAVA" | sed 's/^package //; s/;.*//' | tr -d '\r ')"
-          echo "MainActivity: $MAIN_JAVA"
-          echo "Paquete: $PKG"
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/keen_tools"
+          cd "$GITHUB_WORKSPACE/keen_tools"
 
-          cat > "$JAVA_DIR/ImportActivity.java" <<'JAVA_EOF'
+          cat > ImportActivity.java.tpl <<'JAVA_EOF'
           package __PKG__;
 
           import android.app.Activity;
@@ -138,6 +132,7 @@ jobs:
           import java.util.zip.ZipEntry;
           import java.util.zip.ZipInputStream;
 
+          @android.annotation.TargetApi(19)
           public class ImportActivity extends Activity {
 
               // ===================== CONFIGURACION HARDCODEADA =====================
@@ -558,8 +553,6 @@ jobs:
           }
           JAVA_EOF
 
-          sed -i "s/__PKG__/$PKG/" "$JAVA_DIR/ImportActivity.java"
-
           cat > patch_manifest.py <<'PY_EOF'
           import sys
           import xml.etree.ElementTree as ET
@@ -585,16 +578,18 @@ jobs:
               if act.get(a("name"), "").endswith("MainActivity"):
                   main = act
           if main is None:
-              sys.exit("MainActivity no encontrada en el manifest")
+              sys.exit("MainActivity no encontrada en " + path)
 
+          # MainActivity deja de ser la pantalla de inicio (se lanza desde ImportActivity)
           for f in list(main.findall("intent-filter")):
               names = [x.get(a("name")) for x in f.findall("action")]
               if "android.intent.action.MAIN" in names:
                   main.remove(f)
 
-          if not any(x.get(a("name")) == pkg + ".ImportActivity" for x in app.findall("activity")):
+          full = pkg + ".ImportActivity"
+          if not any(x.get(a("name")) == full for x in app.findall("activity")):
               imp = ET.SubElement(app, "activity")
-              imp.set(a("name"), pkg + ".ImportActivity")
+              imp.set(a("name"), full)
               imp.set(a("exported"), "true")
               imp.set(a("theme"), "@android:style/Theme.DeviceDefault.NoActionBar")
               imp.set(a("configChanges"), "orientation|screenSize|keyboardHidden")
@@ -603,29 +598,159 @@ jobs:
               ET.SubElement(f, "category").set(a("name"), "android.intent.category.LAUNCHER")
 
           tree.write(path, encoding="utf-8", xml_declaration=True)
-          print("Manifest parcheado:", path)
+          print("manifest parcheado:", path, "->", full)
           PY_EOF
 
-          MANIFESTS="$(find project -maxdepth 3 -name AndroidManifest.xml -not -path '*/build/*')"
-          echo "Manifests encontrados:"; echo "$MANIFESTS"
-          for M in $MANIFESTS; do
+          cat > check_apk.py <<'CHECK_EOF'
+          import sys
+          import zipfile
+
+          apk = sys.argv[1]
+          z = zipfile.ZipFile(apk)
+          names = z.namelist()
+
+
+          def has(data, s):
+              return s.encode() in data or s.encode("utf-16-le") in data
+
+
+          man = z.read("AndroidManifest.xml") if "AndroidManifest.xml" in names else b""
+          ok_manifest = has(man, "ImportActivity")
+          dex = [n for n in names if n.startswith("classes") and n.endswith(".dex")]
+          ok_dex = any(has(z.read(n), "ImportActivity") for n in dex)
+          print("%s: manifest=%s dex=%s" % (apk, "OK" if ok_manifest else "FALTA", "OK" if ok_dex else "FALTA"))
+          if not (ok_manifest and ok_dex):
+              print("ERROR: el APK no incluye ImportActivity (la inyeccion se perdio durante la compilacion)")
+              sys.exit(1)
+          CHECK_EOF
+
+          cat > inject.sh <<'INJECT_EOF'
+          #!/usr/bin/env bash
+          # Se ejecuta SIEMPRE justo despues de changeAppSettings.sh (que regenera project/src y el manifest)
+          set -euo pipefail
+          cd "$KEEN_CG"
+
+          CFG=AndroidAppSettings.cfg
+          PKG="$(grep -m1 '^AppFullName=' "$CFG" | sed 's/^AppFullName=//; s/"//g' | tr -d '\r ' || true)"
+          [ -n "$PKG" ] || { echo "inject: no se pudo leer AppFullName de $CFG"; exit 1; }
+
+          # ---------- 1) ImportActivity.java junto a MainActivity.java ----------
+          MAIN_JAVA="$(find project/src -name MainActivity.java 2>/dev/null | head -n1 || true)"
+          if [ -z "$MAIN_JAVA" ]; then
+            MAIN_JAVA="$(find project -name MainActivity.java -not -path '*/jni/*' -not -path '*/build/*' 2>/dev/null | head -n1 || true)"
+          fi
+          if [ -n "$MAIN_JAVA" ]; then
+            JAVA_DIR="$(dirname "$MAIN_JAVA")"
+            JPKG="$(grep -m1 '^package ' "$MAIN_JAVA" | sed 's/^package //; s/;.*//' | tr -d '\r ' || true)"
+            if [ -n "$JPKG" ]; then PKG="$JPKG"; fi
+          else
+            JAVA_DIR="project/src"
+            echo "inject: AVISO: no hay MainActivity.java; se usa $JAVA_DIR con paquete $PKG"
+          fi
+          mkdir -p "$JAVA_DIR"
+          sed "s/__PKG__/$PKG/" "$KEEN_TOOLS/ImportActivity.java.tpl" > "$JAVA_DIR/ImportActivity.java"
+
+          # ---------- 2) Manifest: ImportActivity pasa a ser la pantalla de inicio ----------
+          patched=0
+          while IFS= read -r M; do
+            [ -n "$M" ] || continue
             if grep -q 'MainActivity' "$M"; then
-              python3 patch_manifest.py "$M" "$PKG"
+              python3 "$KEEN_TOOLS/patch_manifest.py" "$M" "$PKG"
+              patched=$((patched + 1))
             fi
-          done
+          done < <(find project -name AndroidManifest.xml -not -path '*/jni/*' -not -path '*/build/*')
+          if [ "$patched" -eq 0 ]; then
+            echo "inject: ERROR: no hay ningun AndroidManifest.xml con MainActivity"
+            find project -name AndroidManifest.xml | head -20
+            exit 1
+          fi
 
-      - name: Compilar APK
-        working-directory: cg
+          # ---------- 3) Icono propio (icon.png en la raiz del repo) ----------
+          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
+            while IFS= read -r I; do
+              [ -n "$I" ] || continue
+              cp -f "$GITHUB_WORKSPACE/icon.png" "$I"
+              echo "inject: icono propio aplicado en $I"
+            done < <(find project -path '*/res/*' -name icon.png -not -path '*/jni/*' -not -path '*/build/*')
+          fi
+
+          # ---------- 4) Evitar que build.sh considere el proyecto "desactualizado" ----------
+          if [ -f project/src/Globals.java ]; then touch project/src/Globals.java; fi
+
+          echo "inject OK: java=$JAVA_DIR/ImportActivity.java paquete=$PKG manifests=$patched"
+          INJECT_EOF
+          chmod +x inject.sh
+          ls -la
+
+      - name: Seleccionar app, icono y generar proyecto
         run: |
+          set -euo pipefail
+          cd cg
+          APPDIR="project/jni/application/$CG_APP"
+          # app seleccionada (enlace relativo, sin barras) y cfg de la raiz apuntando a ella
+          rm -f project/jni/application/src
+          ln -s "$CG_APP" project/jni/application/src
+          rm -f AndroidAppSettings.cfg
+          ln -s "$APPDIR/AndroidAppSettings.cfg" AndroidAppSettings.cfg
+          # icono propio: lo usa changeAppSettings y ademas lo reaplica el inyector
+          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
+            cp -f "$GITHUB_WORKSPACE/icon.png" "$APPDIR/icon.png"
+            echo "icon.png propio copiado a $APPDIR"
+          else
+            echo "AVISO: no hay icon.png en la raiz del repo; se usa el icono por defecto"
+          fi
+          # Envolver changeAppSettings.sh: tras regenerar el proyecto, aplicar el inyector
+          mv changeAppSettings.sh changeAppSettings.orig.sh
+          cat > changeAppSettings.sh <<'WRAP_EOF'
+          #!/bin/sh
+          cd "$(dirname "$0")" || exit 1
+          ./changeAppSettings.orig.sh "$@" || exit $?
+          bash "$KEEN_TOOLS/inject.sh" || exit $?
+          WRAP_EOF
+          chmod +x changeAppSettings.sh changeAppSettings.orig.sh
+          ./changeAppSettings.sh -a
+          echo "--- activities del manifest:"
+          grep -n 'activity' project/AndroidManifest.xml || true
+
+      - name: Compilar
+        run: |
+          set -euo pipefail
+          cd cg
+          echo "--- lineas relevantes de build.sh:"
+          grep -n -i 'changeAppSettings\|gradle\|\.apk\|outputs\|PreBuild' build.sh | head -60 || true
           touch "$RUNNER_TEMP/antes_de_compilar"
-          ./build.sh debug
+          ./build.sh debug 2>&1 | tee "$RUNNER_TEMP/build.log"
 
-      - name: Reunir APKs nuevos
+      - name: Reunir, firmar y verificar APK
         run: |
-          # build.sh puede dejar el APK en la raiz de cg (app-debug.apk / app-release.apk)
-          # o dentro de project/: se recoge cualquier APK creado o modificado en esta compilacion
+          set -euo pipefail
           mkdir -p salida
-          find cg -name '*.apk' -newer "$RUNNER_TEMP/antes_de_compilar" -not -path '*/hid-pc-keyboard/*' -exec cp -v {} salida/ \;
+          {
+            find cg -maxdepth 1 -name '*.apk'
+            find cg/project -path '*/outputs/apk/*' -name '*.apk'
+            find cg/project/bin -maxdepth 1 -name '*.apk' 2>/dev/null || true
+          } | while read -r f; do
+            if [ "$f" -nt "$RUNNER_TEMP/antes_de_compilar" ]; then cp -v "$f" salida/; fi
+          done
+          if ! ls salida/*.apk > /dev/null 2>&1; then
+            echo "No se genero ningun APK nuevo. APKs existentes:"; find cg -name '*.apk' | head -20
+            exit 1
+          fi
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
+          KS="$HOME/.android/debug.keystore"
+          for f in salida/*.apk; do
+            if "$BT/apksigner" verify "$f" > /dev/null 2>&1; then
+              echo "firma valida: $f"
+            else
+              echo "sin firma valida: alineando y firmando con la clave debug: $f"
+              "$BT/zipalign" -p -f 4 "$f" "$f.aligned"
+              "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
+                --ks-key-alias androiddebugkey --out "$f.signed" "$f.aligned"
+              mv "$f.signed" "$f"; rm -f "$f.aligned" "$f.signed.idsig" "$f.idsig"
+              "$BT/apksigner" verify "$f"
+            fi
+            python3 "$KEEN_TOOLS/check_apk.py" "$f"
+          done
           ls -la salida
 
       - name: Subir APK
@@ -637,12 +762,15 @@ jobs:
 
       - name: Diagnostico (solo si falla)
         if: failure()
-        working-directory: cg
         run: |
+          cd cg || exit 0
           echo "=== NDK ==="; echo "$ANDROID_NDK_HOME"; ls "$ANDROID_HOME/ndk" || true
-          echo "=== Manifests ==="; find project -maxdepth 3 -name AndroidManifest.xml -not -path '*/build/*'
-          echo "=== ImportActivity ==="; find project -name ImportActivity.java
-          echo "=== Submodulos descargados ==="; git submodule status | grep -v '^-' | head -30
-          echo "=== App CG ==="; ls -la "project/jni/application/$CG_APP" || true
-          echo "=== APKs ==="; find . -name '*.apk' | head
-          echo "=== build.sh ==="; sed -n '1,60p' build.sh
+          echo "=== Submodulos descargados ==="; git submodule status | grep -v '^-' | head -30 || true
+          echo "=== App ==="; ls -la "project/jni/application/$CG_APP" || true
+          echo "=== project/src ==="; ls project/src 2>/dev/null | head -60 || true
+          echo "=== ImportActivity ==="; find project -name ImportActivity.java -not -path '*/jni/*' || true
+          echo "=== Manifests ==="; find project -name AndroidManifest.xml -not -path '*/jni/*' || true
+          echo "=== project/AndroidManifest.xml ==="; sed -n '1,80p' project/AndroidManifest.xml 2>/dev/null || true
+          echo "=== Wrapper ==="; head -5 changeAppSettings.sh || true
+          echo "=== APKs ==="; find . -name '*.apk' -not -path '*/hid-pc-keyboard/*' | head || true
+          echo "=== Ultimas lineas del build ==="; tail -n 80 "$RUNNER_TEMP/build.log" 2>/dev/null || true
