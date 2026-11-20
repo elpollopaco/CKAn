@@ -16,6 +16,8 @@
 #              el ZIP y las carpetas originales
 #        - parche del manifest (ImportActivity como pantalla de inicio)
 #        - tu icon.png de la raiz del repo como icono
+#      Compila solo arm64-v8a (Moto G23) y crea enlaces <triple><api>-ar etc. que el NDK
+#      moderno ya no trae (sin ellos falla OpenSSL: "aarch64-linux-android21-ar: No such file").
 #   3. Compila, firma (clave debug si hace falta) y VERIFICA que el APK
 #      contiene ImportActivity antes de subirlo como artefacto.
 #
@@ -30,7 +32,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       CG_BRANCH: sdl_android
@@ -74,6 +76,21 @@ jobs:
           if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then echo "No hay NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; fi
           echo "NDK usado: $NDK"
           echo "$NDK" >> "$GITHUB_PATH"
+          # NDK >= r23 ya no trae binutils (<triple><api>-ar, -ranlib...) pero la distro (OpenSSL) los pide:
+          # crear enlaces a las herramientas LLVM equivalentes
+          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          if [ ! -x "$LLVM/llvm-ar" ]; then echo "No hay llvm-ar en $LLVM"; ls "$NDK/toolchains" || true; exit 1; fi
+          SHIM="$RUNNER_TEMP/ndkshim"
+          mkdir -p "$SHIM"
+          for triple in aarch64-linux-android armv7a-linux-androideabi arm-linux-androideabi i686-linux-android x86_64-linux-android; do
+            for api in "" $(seq 16 36); do
+              for pair in ar:llvm-ar ranlib:llvm-ranlib strip:llvm-strip nm:llvm-nm objdump:llvm-objdump objcopy:llvm-objcopy readelf:llvm-readelf ld:ld.lld; do
+                ln -sf "$LLVM/${pair#*:}" "$SHIM/${triple}${api}-${pair%%:*}"
+              done
+            done
+          done
+          echo "$SHIM" >> "$GITHUB_PATH"
+          echo "enlaces de herramientas creados: $(ls "$SHIM" | wc -l)"
           {
             echo "ANDROID_NDK_HOME=$NDK"
             echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
@@ -692,6 +709,10 @@ jobs:
           ln -s "$CG_APP" project/jni/application/src
           rm -f AndroidAppSettings.cfg
           ln -s "$APPDIR/AndroidAppSettings.cfg" AndroidAppSettings.cfg
+          # Solo arm64-v8a (tu Moto G23): compila mucho mas rapido y evita fallos de ABIs viejas con NDK moderno
+          CFG="$APPDIR/AndroidAppSettings.cfg"
+          if grep -q '^MultiABI=' "$CFG"; then sed -i 's/^MultiABI=.*/MultiABI=arm64-v8a/' "$CFG"; else echo 'MultiABI=arm64-v8a' >> "$CFG"; fi
+          grep -n '^MultiABI=' "$CFG"
           # icono propio: lo usa changeAppSettings y ademas lo reaplica el inyector
           if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
             cp -f "$GITHUB_WORKSPACE/icon.png" "$APPDIR/icon.png"
