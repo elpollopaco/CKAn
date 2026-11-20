@@ -19,6 +19,7 @@
 #      Compila solo arm64-v8a (Moto G23) y crea enlaces <triple><api>-ar etc. que el NDK
 #      moderno ya no trae (sin ellos falla OpenSSL: "aarch64-linux-android21-ar: No such file"),
 #      y tolera el fallo del parche multi-ABI de cabeceras de OpenSSL (solo con una ABI).
+#      Anade las cabeceras de Boost (el motor las pide para su descargador) via CPLUS_INCLUDE_PATH.
 #   3. Compila, firma (clave debug si hace falta) y VERIFICA que el APK
 #      contiene ImportActivity antes de subirlo como artefacto.
 #
@@ -124,6 +125,32 @@ jobs:
               -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
+
+      - name: Cabeceras de Boost (las pide el motor y la distro no las trae)
+        run: |
+          set -euo pipefail
+          # Commander Genius incluye <boost/property_tree/...> (cabeceras, sin librerias) para su descargador
+          BOOST_INC=""
+          for d in /usr/include /usr/local/include "${BOOST_ROOT:-}" /usr/local/share/boost/*; do
+            if [ -n "$d" ] && [ -f "$d/boost/property_tree/ptree_fwd.hpp" ]; then BOOST_INC="$d"; break; fi
+          done
+          if [ -z "$BOOST_INC" ]; then
+            echo "Boost no esta en el runner: instalando libboost-dev (solo cabeceras)"
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y --no-install-recommends libboost-dev
+            BOOST_INC=/usr/include
+          fi
+          test -f "$BOOST_INC/boost/property_tree/ptree_fwd.hpp"
+          echo "Boost en: $BOOST_INC"
+          grep -m1 'define BOOST_LIB_VERSION' "$BOOST_INC/boost/version.hpp" || true
+          # carpeta con SOLO "boost" para poder usarla con -I sin tapar las cabeceras del NDK
+          mkdir -p "$RUNNER_TEMP/boost_headers"
+          ln -sfn "$BOOST_INC/boost" "$RUNNER_TEMP/boost_headers/boost"
+          # clang/g++ leen CPLUS_INCLUDE_PATH (solo C++) sin tocar el cfg ni el Settings.mk de la distro
+          {
+            echo "KEEN_BOOST_INC=$RUNNER_TEMP/boost_headers"
+            echo "CPLUS_INCLUDE_PATH=$RUNNER_TEMP/boost_headers${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
+          } >> "$GITHUB_ENV"
 
       - name: Herramientas del inyector
         run: |
@@ -829,4 +856,8 @@ jobs:
           echo "=== project/AndroidManifest.xml ==="; sed -n '1,80p' project/AndroidManifest.xml 2>/dev/null || true
           echo "=== Wrapper ==="; head -5 changeAppSettings.sh || true
           echo "=== APKs ==="; find . -name '*.apk' -not -path '*/hid-pc-keyboard/*' | head || true
+          echo "=== cfg: AppCflags / librerias ==="; grep -n '^AppCflags=\|^CompiledLibraries=\|^AppLibraries=\|^MultiABI=' "project/jni/application/$CG_APP/AndroidAppSettings.cfg" || true
+          echo "=== Boost ==="; echo "CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH:-sin definir}"; ls -la "${KEEN_BOOST_INC:-/nonexistent}" 2>/dev/null || true
+          echo "=== OpenSSL: parches rechazados (.rej) ==="
+          find project/jni/openssl -name '*.rej' 2>/dev/null | while read -r f; do echo "--- $f"; cat "$f"; done || true
           echo "=== Ultimas lineas del build ==="; tail -n 80 "$RUNNER_TEMP/build.log" 2>/dev/null || true
