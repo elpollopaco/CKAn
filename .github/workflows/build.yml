@@ -17,7 +17,8 @@
 #        - parche del manifest (ImportActivity como pantalla de inicio)
 #        - tu icon.png de la raiz del repo como icono
 #      Compila solo arm64-v8a (Moto G23) y crea enlaces <triple><api>-ar etc. que el NDK
-#      moderno ya no trae (sin ellos falla OpenSSL: "aarch64-linux-android21-ar: No such file").
+#      moderno ya no trae (sin ellos falla OpenSSL: "aarch64-linux-android21-ar: No such file"),
+#      y tolera el fallo del parche multi-ABI de cabeceras de OpenSSL (solo con una ABI).
 #   3. Compila, firma (clave debug si hace falta) y VERIFICA que el APK
 #      contiene ImportActivity antes de subirlo como artefacto.
 #
@@ -89,7 +90,26 @@ jobs:
               done
             done
           done
+          # OpenSSL: el parche multi-ABI de sus cabeceras (bn_conf.h / opensslconf.h) esta pensado para la
+          # cabecera de 32 bits y no aplica cuando se compila solo arm64; la cabecera de arm64 ya es correcta.
+          # Este wrapper tolera SOLO ese fallo (y solo con KEEN_SINGLE_ABI=1); cualquier otro fallo de patch se propaga.
+          cat > "$SHIM/patch" <<'PATCH_EOF'
+          #!/bin/bash
+          out="$(mktemp)"
+          command -p patch "$@" 2>&1 | tee "$out"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ] && [ "${KEEN_SINGLE_ABI:-0}" = "1" ]; then
+            others="$(grep -E '^patching file' "$out" | grep -v -E 'include/(crypto/bn_conf|openssl/opensslconf)\.h' || true)"
+            if grep -q -E '^patching file include/(crypto/bn_conf|openssl/opensslconf)\.h' "$out" && [ -z "$others" ]; then
+              echo "[shim patch] fallo tolerado en cabeceras OpenSSL (build de una sola ABI)"
+              rm -f "$out"; exit 0
+            fi
+          fi
+          rm -f "$out"; exit "$rc"
+          PATCH_EOF
+          chmod +x "$SHIM/patch"
           echo "$SHIM" >> "$GITHUB_PATH"
+          echo "KEEN_SINGLE_ABI=1" >> "$GITHUB_ENV"
           echo "enlaces de herramientas creados: $(ls "$SHIM" | wc -l)"
           {
             echo "ANDROID_NDK_HOME=$NDK"
@@ -683,12 +703,25 @@ jobs:
           fi
 
           # ---------- 3) Icono propio (icon.png en la raiz del repo) ----------
-          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
+          ICON="$GITHUB_WORKSPACE/icon.png"
+          if [ -f "$ICON" ]; then
+            # 3a) icon.png y iconos de launcher (ic_launcher*.png) ya generados -> tu icono
             while IFS= read -r I; do
               [ -n "$I" ] || continue
-              cp -f "$GITHUB_WORKSPACE/icon.png" "$I"
+              cp --remove-destination "$ICON" "$I"
               echo "inject: icono propio aplicado en $I"
-            done < <(find project -path '*/res/*' -name icon.png -not -path '*/jni/*' -not -path '*/build/*')
+            done < <(find project -path '*/res/*' \( -name icon.png -o -name ic_launcher.png -o -name ic_launcher_round.png \) -not -path '*/jni/*' -not -path '*/build/*')
+            # 3b) en cada carpeta res con mipmap-*: garantizar ic_launcher.png y quitar el icono adaptativo (xml),
+            #     que en Android 8+ taparia el PNG
+            while IFS= read -r R; do
+              [ -n "$R" ] || continue
+              if ls -d "$R"/mipmap-* > /dev/null 2>&1; then
+                mkdir -p "$R/mipmap-xxxhdpi"
+                cp --remove-destination "$ICON" "$R/mipmap-xxxhdpi/ic_launcher.png"
+                find "$R" -path '*/mipmap-anydpi*' -name 'ic_launcher*.xml' -print -delete
+                echo "inject: icono de launcher garantizado en $R"
+              fi
+            done < <(find project -type d -name res -not -path '*/jni/*' -not -path '*/build/*')
           fi
 
           # ---------- 4) Evitar que build.sh considere el proyecto "desactualizado" ----------
@@ -715,8 +748,10 @@ jobs:
           grep -n '^MultiABI=' "$CFG"
           # icono propio: lo usa changeAppSettings y ademas lo reaplica el inyector
           if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
-            cp -f "$GITHUB_WORKSPACE/icon.png" "$APPDIR/icon.png"
+            rm -f "$APPDIR/icon.png"   # es un enlace al logo del motor: no escribir a traves de el
+            cp "$GITHUB_WORKSPACE/icon.png" "$APPDIR/icon.png"
             echo "icon.png propio copiado a $APPDIR"
+
           else
             echo "AVISO: no hay icon.png en la raiz del repo; se usa el icono por defecto"
           fi
