@@ -76,8 +76,8 @@ jobs:
                   applicationId "com.elpollopaco.commanderkeen"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
               }
 
               buildTypes {
@@ -888,7 +888,7 @@ jobs:
           .dosbox-overlay,.dosbox-powered,.dosbox-start,.dosbox-loader{display:none!important}
           #controls{position:fixed;inset:0;z-index:20;pointer-events:none}
           #controls>*{pointer-events:auto;touch-action:none}
-          #dpad{position:fixed;left:max(3vw,env(safe-area-inset-left));bottom:5vh;width:min(40vh,30vw);height:min(40vh,30vw);
+          #dpad{touch-action:none;position:fixed;left:max(3vw,env(safe-area-inset-left));bottom:5vh;width:min(40vh,30vw);height:min(40vh,30vw);
             border-radius:50%;background:rgba(255,255,255,.10);border:2px solid rgba(255,255,255,.35)}
           #dpad b{position:absolute;display:flex;align-items:center;justify-content:center;width:34%;height:34%;
             font-size:min(7vh,5vw);color:rgba(255,255,255,.55);pointer-events:none}
@@ -896,7 +896,7 @@ jobs:
           #dU{left:33%;top:2%}#dD{left:33%;bottom:2%}#dL{left:2%;top:33%}#dR{right:2%;top:33%}
           #btns{position:fixed;right:max(3vw,env(safe-area-inset-right));bottom:5vh;width:min(46vh,34vw);height:min(46vh,34vw);
             display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:5%}
-          .gb{border-radius:50%;border:2px solid rgba(255,255,255,.45);background:rgba(255,255,255,.12);
+          .gb{touch-action:none;border-radius:50%;border:2px solid rgba(255,255,255,.45);background:rgba(255,255,255,.12);
             display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.1;color:#fff}
           .gb b{font-size:min(4vh,2.8vw)}
           .gb i{font-style:normal;font-size:min(2.6vh,1.8vw);opacity:.8}
@@ -911,6 +911,7 @@ jobs:
           #pause .box .pbtn{display:block;width:100%;margin:0 0 1.6vh}
           #keys{display:flex;flex-wrap:wrap;gap:1vw;justify-content:center;margin-bottom:1.6vh}
           #keys .tb{pointer-events:auto}
+          #dbg{font-size:min(2.8vh,13px);color:#cfe;margin:0 0 1.6vh;line-height:1.35}
           #kb{position:fixed;left:-200px;top:0;width:20px;height:20px;opacity:0}
           #toast{position:fixed;left:50%;bottom:3vh;transform:translateX(-50%);background:#000c;border:2px solid var(--cyan);
             border-radius:10px;padding:1vh 2vw;z-index:200;display:none;font-size:min(3.2vh,15px)}
@@ -954,6 +955,7 @@ jobs:
             <div class="box">
               <p>Pausa / teclas extra</p>
               <div id="keys"></div>
+              <div id="dbg"></div>
               <button class="pbtn big" id="pResume">Continuar</button>
               <button class="pbtn" id="pExit">Salir al men&uacute;</button>
             </div>
@@ -1122,6 +1124,42 @@ jobs:
 
             // ------------------------------------------------------------ keys
             var held = {};
+            var sentCount = 0, lastCode = 0;
+            var KEYINFO = {
+              37: ['ArrowLeft', 'ArrowLeft'], 38: ['ArrowUp', 'ArrowUp'], 39: ['ArrowRight', 'ArrowRight'],
+              40: ['ArrowDown', 'ArrowDown'], 17: ['Control', 'ControlLeft'], 18: ['Alt', 'AltLeft'],
+              32: [' ', 'Space'], 13: ['Enter', 'Enter'], 27: ['Escape', 'Escape'], 8: ['Backspace', 'Backspace'],
+              112: ['F1', 'F1'], 113: ['F2', 'F2'], 114: ['F3', 'F3']
+            };
+
+            // Second path: a real DOM keyboard event on the canvas (what js-dos/SDL listens to with a physical keyboard).
+            function domKey(code, down) {
+              var info = KEYINFO[code], ch = String.fromCharCode(code);
+              if (!info) {
+                info = [ch.toLowerCase(), (code >= 65 && code <= 90) ? 'Key' + ch : ((code >= 48 && code <= 57) ? 'Digit' + ch : '')];
+              }
+              var ev;
+              try {
+                ev = new KeyboardEvent(down ? 'keydown' : 'keyup', {
+                  key: info[0], code: info[1], keyCode: code, which: code,
+                  ctrlKey: !!held[K.CTRL], altKey: !!held[K.ALT], shiftKey: false,
+                  bubbles: true, cancelable: true
+                });
+              } catch (e) { return; }
+              try {
+                if (ev.keyCode !== code) { Object.defineProperty(ev, 'keyCode', { get: function () { return code; } }); }
+                if (ev.which !== code) { Object.defineProperty(ev, 'which', { get: function () { return code; } }); }
+              } catch (e) { /* ignore */ }
+              try { canvas.dispatchEvent(ev); } catch (e) { /* ignore */ }
+            }
+
+            function send(code, down) {
+              sentCount++;
+              lastCode = code;
+              try { ci.simulateKeyEvent(code, down); } catch (e) { /* ignore */ }
+              domKey(code, down);
+            }
+
             function key(code, down) {
               if (!ci) { return; }
               if (down) {
@@ -1133,14 +1171,14 @@ jobs:
                 if (held[code] > 0) { return; }
                 delete held[code];
               }
-              try { ci.simulateKeyEvent(code, down); } catch (e) { /* ignore */ }
+              send(code, down);
             }
             function releaseAll() {
               var codes = Object.keys(held), i;
-              for (i = 0; i < codes.length; i++) {
-                try { if (ci) { ci.simulateKeyEvent(parseInt(codes[i], 10), false); } } catch (e) { /* ignore */ }
-              }
               held = {};
+              if (ci) {
+                for (i = 0; i < codes.length; i++) { send(parseInt(codes[i], 10), false); }
+              }
               setDir({ l: false, r: false, u: false, d: false });
             }
             function tap(code) {
@@ -1284,6 +1322,11 @@ jobs:
               var open = typeof force === 'boolean' ? force : p.style.display !== 'flex';
               p.style.display = open ? 'flex' : 'none';
               releaseAll();
+              if (open) {
+                $('dbg').textContent = 'Motor: ' + (ci ? 'listo' : 'NO listo') +
+                  ' | simulateKeyEvent: ' + (ci && typeof ci.simulateKeyEvent === 'function' ? 'si' : 'no') +
+                  ' | teclas enviadas: ' + sentCount + ' | ultima: ' + lastCode;
+              }
             }
             $('tMenu').addEventListener('click', function () { togglePause(true); });
             $('pResume').addEventListener('click', function () { togglePause(false); });
@@ -1356,6 +1399,7 @@ jobs:
                     return main(['-c', 'cd keen' + n, '-c', exe]);
                   }).then(function (c) {
                     ci = c;
+                    try { canvas.setAttribute('tabindex', '0'); canvas.focus(); } catch (e) { /* ignore */ }
                     busy(false);
                     setupGamepad(c);
                   }).catch(function (e) { failGame(e); });
