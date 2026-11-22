@@ -1,863 +1,1456 @@
-# =============================================================================
-# Commander Keen (1-6, Dreams, Keen 7 mod) para Android - build.yml unico
+# Commander Keen 1-7 para Android (sin Commander Genius).
+# Un solo archivo: este build.yml genera el proyecto Android completo, descarga DOSBox (js-dos 6.22.60)
+# y compila el APK. Pon tambien un icon.png en la raiz del repo (es el icono de la app).
 #
-# Colocar en: .github/workflows/build.yml
-# Colocar tambien: icon.png en la raiz del repo (icono propio de la app)
-#
-# Que hace:
-#   1. Clona la distro Android de Commander Genius (pelya/commandergenius),
-#      SIN descargar las apps ajenas (Teeworlds, OpenTTD...) que daban timeout.
-#   2. Instala un "inyector": envuelve changeAppSettings.sh para que, cada vez
-#      que la distro regenere el proyecto, se vuelva a aplicar:
-#        - ImportActivity (pantalla inicial que pide el ZIP de los juegos):
-#            * verifica el SHA-256 hardcodeado (EXPECTED_SHA256 en el Java)
-#            * copia los juegos a files/games de la app (Commander Genius los
-#              detecta solo y los muestra en la coleccion); luego puedes borrar
-#              el ZIP y las carpetas originales
-#        - parche del manifest (ImportActivity como pantalla de inicio)
-#        - tu icon.png de la raiz del repo como icono
-#      Compila solo arm64-v8a (Moto G23) y crea enlaces <triple><api>-ar etc. que el NDK
-#      moderno ya no trae (sin ellos falla OpenSSL: "aarch64-linux-android21-ar: No such file"),
-#      y tolera el fallo del parche multi-ABI de cabeceras de OpenSSL (solo con una ABI).
-#      Anade las cabeceras de Boost (el motor las pide para su descargador) via CPLUS_INCLUDE_PATH.
-#   3. Compila, firma (clave debug si hace falta) y VERIFICA que el APK
-#      contiene ImportActivity antes de subirlo como artefacto.
-#
-# Si algo falla, el ultimo paso imprime un diagnostico completo.
-# =============================================================================
-name: Build Commander Keen APK
+# Como funciona: la app abre un WebView sin internet, importa el ZIP (comprobando su SHA-256),
+# copia los juegos dentro de la app y los ejecuta con DOSBox (WebAssembly) con controles tactiles propios.
+name: Commander Keen APK
 
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      CG_BRANCH: sdl_android
-      CG_APP: commandergenius
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout (tu repo)
-        uses: actions/checkout@v5
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
 
       - name: Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Clonar distro (sin las apps ajenas)
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Crear proyecto Android (Gradle, manifiesto, estilos)
         run: |
           set -euo pipefail
-          # El runner no puede usar git:// (puerto 9418): forzar https
-          git config --global url."https://github.com/".insteadOf "git://github.com/"
-          git clone --branch "$CG_BRANCH" https://github.com/pelya/commandergenius.git cg
-          cd cg
-          # No descargar los submodulos de otras apps (Teeworlds, OpenTTD, etc.)
-          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | while read -r key path; do
-            name="${key#submodule.}"; name="${name%.path}"
-            case "$path" in
-              "project/jni/application/$CG_APP"/*) echo "descargar: $path" ;;
-              project/jni/application/*) git config "submodule.$name.update" none; echo "omitir:    $path" ;;
-              *) echo "descargar: $path" ;;
-            esac
-          done
-          git submodule update --init --recursive --jobs 4
-          test -f "project/jni/application/$CG_APP/AndroidAppSettings.cfg" || { echo "Falta el cfg de $CG_APP"; ls project/jni/application; exit 1; }
-          test -d "project/jni/application/$CG_APP/commandergenius" || { echo "Falta el codigo de Commander Genius"; exit 1; }
+          mkdir -p android/app/src/main/java/com/elpollopaco/commanderkeen android/app/src/main/assets/www/jsdos android/app/src/main/res/values
+          cat > android/settings.gradle <<'__KEEN_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CommanderKeen"
+          include ':app'
+          __KEEN_EOF__
+          cat > android/build.gradle <<'__KEEN_EOF__'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          __KEEN_EOF__
+          cat > android/gradle.properties <<'__KEEN_EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          __KEEN_EOF__
+          cat > android/app/build.gradle <<'__KEEN_EOF__'
+          plugins {
+              id 'com.android.application'
+          }
 
-      - name: Entorno Android (licencias, NDK, clave debug)
+          android {
+              namespace 'com.elpollopaco.commanderkeen'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.elpollopaco.commanderkeen"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.8.0'
+          }
+          __KEEN_EOF__
+          cat > android/app/src/main/AndroidManifest.xml <<'__KEEN_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:hardwareAccelerated="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Commander Keen"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:windowSoftInputMode="adjustNothing">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          __KEEN_EOF__
+          cat > android/app/src/main/res/values/styles.xml <<'__KEEN_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          __KEEN_EOF__
+
+      - name: Crear codigo Java (importador y actividad)
         run: |
           set -euo pipefail
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          ln -sfn "$ANDROID_HOME/licenses" cg/project/licenses
-          NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then echo "No hay NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; fi
-          echo "NDK usado: $NDK"
-          echo "$NDK" >> "$GITHUB_PATH"
-          # NDK >= r23 ya no trae binutils (<triple><api>-ar, -ranlib...) pero la distro (OpenSSL) los pide:
-          # crear enlaces a las herramientas LLVM equivalentes
-          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          if [ ! -x "$LLVM/llvm-ar" ]; then echo "No hay llvm-ar en $LLVM"; ls "$NDK/toolchains" || true; exit 1; fi
-          SHIM="$RUNNER_TEMP/ndkshim"
-          mkdir -p "$SHIM"
-          for triple in aarch64-linux-android armv7a-linux-androideabi arm-linux-androideabi i686-linux-android x86_64-linux-android; do
-            for api in "" $(seq 16 36); do
-              for pair in ar:llvm-ar ranlib:llvm-ranlib strip:llvm-strip nm:llvm-nm objdump:llvm-objdump objcopy:llvm-objcopy readelf:llvm-readelf ld:ld.lld; do
-                ln -sf "$LLVM/${pair#*:}" "$SHIM/${triple}${api}-${pair%%:*}"
-              done
-            done
-          done
-          # OpenSSL: el parche multi-ABI de sus cabeceras (bn_conf.h / opensslconf.h) esta pensado para la
-          # cabecera de 32 bits y no aplica cuando se compila solo arm64; la cabecera de arm64 ya es correcta.
-          # Este wrapper tolera SOLO ese fallo (y solo con KEEN_SINGLE_ABI=1); cualquier otro fallo de patch se propaga.
-          cat > "$SHIM/patch" <<'PATCH_EOF'
-          #!/bin/bash
-          out="$(mktemp)"
-          command -p patch "$@" 2>&1 | tee "$out"
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" -ne 0 ] && [ "${KEEN_SINGLE_ABI:-0}" = "1" ]; then
-            others="$(grep -E '^patching file' "$out" | grep -v -E 'include/(crypto/bn_conf|openssl/opensslconf)\.h' || true)"
-            if grep -q -E '^patching file include/(crypto/bn_conf|openssl/opensslconf)\.h' "$out" && [ -z "$others" ]; then
-              echo "[shim patch] fallo tolerado en cabeceras OpenSSL (build de una sola ABI)"
-              rm -f "$out"; exit 0
-            fi
-          fi
-          rm -f "$out"; exit "$rc"
-          PATCH_EOF
-          chmod +x "$SHIM/patch"
-          echo "$SHIM" >> "$GITHUB_PATH"
-          echo "KEEN_SINGLE_ABI=1" >> "$GITHUB_ENV"
-          echo "enlaces de herramientas creados: $(ls "$SHIM" | wc -l)"
-          {
-            echo "ANDROID_NDK_HOME=$NDK"
-            echo "ANDROID_SDK_ROOT=$ANDROID_HOME"
-            echo "KEEN_TOOLS=$GITHUB_WORKSPACE/keen_tools"
-            echo "KEEN_CG=$GITHUB_WORKSPACE/cg"
-          } >> "$GITHUB_ENV"
-          # Clave debug (algunos scripts de la distro la esperan en ~/.android)
-          mkdir -p "$HOME/.android"
-          if [ ! -f "$HOME/.android/debug.keystore" ]; then
-            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
-              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          cat > android/app/src/main/java/com/elpollopaco/commanderkeen/KeenImporter.java <<'__KEEN_EOF__'
+          package com.elpollopaco.commanderkeen;
 
-      - name: Cabeceras de Boost (las pide el motor y la distro no las trae)
-        run: |
-          set -euo pipefail
-          # Commander Genius incluye <boost/property_tree/...> (cabeceras, sin librerias) para su descargador
-          BOOST_INC=""
-          for d in /usr/include /usr/local/include "${BOOST_ROOT:-}" /usr/local/share/boost/*; do
-            if [ -n "$d" ] && [ -f "$d/boost/property_tree/ptree_fwd.hpp" ]; then BOOST_INC="$d"; break; fi
-          done
-          if [ -z "$BOOST_INC" ]; then
-            echo "Boost no esta en el runner: instalando libboost-dev (solo cabeceras)"
-            sudo apt-get update -o Acquire::Retries=3
-            sudo apt-get install -y --no-install-recommends libboost-dev
-            BOOST_INC=/usr/include
-          fi
-          test -f "$BOOST_INC/boost/property_tree/ptree_fwd.hpp"
-          echo "Boost en: $BOOST_INC"
-          grep -m1 'define BOOST_LIB_VERSION' "$BOOST_INC/boost/version.hpp" || true
-          # carpeta con SOLO "boost" para poder usarla con -I sin tapar las cabeceras del NDK
-          mkdir -p "$RUNNER_TEMP/boost_headers"
-          ln -sfn "$BOOST_INC/boost" "$RUNNER_TEMP/boost_headers/boost"
-          # clang/g++ leen CPLUS_INCLUDE_PATH (solo C++) sin tocar el cfg ni el Settings.mk de la distro
-          {
-            echo "KEEN_BOOST_INC=$RUNNER_TEMP/boost_headers"
-            echo "CPLUS_INCLUDE_PATH=$RUNNER_TEMP/boost_headers${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
-          } >> "$GITHUB_ENV"
+          import java.io.BufferedOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Enumeration;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.TreeMap;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+          import java.util.zip.ZipEntry;
+          import java.util.zip.ZipFile;
+          import java.util.zip.ZipOutputStream;
 
-      - name: Herramientas del inyector
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/keen_tools"
-          cd "$GITHUB_WORKSPACE/keen_tools"
+          /**
+           * Takes the verified ZIP with the original games and writes one ZIP per episode
+           * (ep1.zip ... ep7.zip) plus games.json into outDir. No Android classes here.
+           * Episode 7 = Keen Dreams.
+           */
+          final class KeenImporter {
 
-          cat > ImportActivity.java.tpl <<'JAVA_EOF'
-          package __PKG__;
+              interface Progress {
+                  void update(String text, int percent);
+              }
+
+              static final String[] TITLES = {
+                  "", "Marooned on Mars", "The Earth Explodes", "Keen Must Die!",
+                  "Secret of the Oracle", "The Armageddon Machine",
+                  "Aliens Ate My Baby Sitter!", "Keen Dreams"
+              };
+
+              private static final Pattern KEEN_EXE = Pattern.compile("^keen([1-6])([a-z]?)\\.exe$");
+              private static final Pattern DREAMS_EXE = Pattern.compile("^kdreams([a-z]?)\\.exe$");
+              private static final Pattern CK_EXT = Pattern.compile("\\.ck([1-6])$");
+
+              private static final class Cand {
+                  int ep;
+                  String dir;   // "" or "folder/sub/" (always ends with '/')
+                  String base;  // exe file name
+                  int score;
+              }
+
+              private KeenImporter() {
+              }
+
+              static String normalize(String name) {
+                  String n = name.replace('\\', '/');
+                  while (n.startsWith("./")) {
+                      n = n.substring(2);
+                  }
+                  while (n.startsWith("/")) {
+                      n = n.substring(1);
+                  }
+                  return n;
+              }
+
+              static String baseName(String path) {
+                  int i = path.lastIndexOf('/');
+                  return i < 0 ? path : path.substring(i + 1);
+              }
+
+              static String dirOf(String path) {
+                  int i = path.lastIndexOf('/');
+                  return i < 0 ? "" : path.substring(0, i + 1);
+              }
+
+              static boolean isJunk(String path) {
+                  String lower = path.toLowerCase(Locale.ROOT);
+                  if (lower.startsWith("__macosx/") || lower.contains("/__macosx/")) {
+                      return true;
+                  }
+                  if (lower.startsWith("../") || lower.contains("/../")) {
+                      return true;
+                  }
+                  String base = baseName(lower);
+                  return base.startsWith("._") || base.equals(".ds_store") || base.equals("thumbs.db");
+              }
+
+              private static boolean belongs(int ep, String rel, Map<Integer, Cand> best) {
+                  String lower = rel.toLowerCase(Locale.ROOT);
+                  for (Cand o : best.values()) {
+                      if (o.ep != ep && lower.equals(o.base.toLowerCase(Locale.ROOT))) {
+                          return false;
+                      }
+                  }
+                  Matcher m = CK_EXT.matcher(lower);
+                  if (m.find()) {
+                      return Integer.parseInt(m.group(1)) == ep;
+                  }
+                  return true;
+              }
+
+              /** Returns episode number -> exe file name for every episode that was installed. */
+              static Map<Integer, String> importZip(File zip, File outDir, Progress progress) throws IOException {
+                  if (!outDir.isDirectory() && !outDir.mkdirs()) {
+                      throw new IOException("No se pudo crear la carpeta de juegos");
+                  }
+                  ZipFile zf = new ZipFile(zip);
+                  try {
+                      List<ZipEntry> files = new ArrayList<ZipEntry>();
+                      List<String> paths = new ArrayList<String>();
+                      Enumeration<? extends ZipEntry> en = zf.entries();
+                      while (en.hasMoreElements()) {
+                          ZipEntry e = en.nextElement();
+                          if (e.isDirectory()) {
+                              continue;
+                          }
+                          String p = normalize(e.getName());
+                          if (p.isEmpty() || p.endsWith("/") || isJunk(p)) {
+                              continue;
+                          }
+                          files.add(e);
+                          paths.add(p);
+                      }
+
+                      Map<Integer, Cand> best = new TreeMap<Integer, Cand>();
+                      for (int i = 0; i < paths.size(); i++) {
+                          String p = paths.get(i);
+                          String base = baseName(p);
+                          String lower = base.toLowerCase(Locale.ROOT);
+                          int ep = 0;
+                          String suffix = "";
+                          Matcher m = KEEN_EXE.matcher(lower);
+                          if (m.matches()) {
+                              ep = Integer.parseInt(m.group(1));
+                              suffix = m.group(2);
+                          } else {
+                              Matcher d = DREAMS_EXE.matcher(lower);
+                              if (d.matches()) {
+                                  ep = 7;
+                                  suffix = d.group(1);
+                              }
+                          }
+                          if (ep == 0) {
+                              continue;
+                          }
+                          Cand c = new Cand();
+                          c.ep = ep;
+                          c.dir = dirOf(p);
+                          c.base = base;
+                          c.score = suffix.equals("c") ? 0 : (suffix.equals("e") ? 2 : 1);
+                          Cand cur = best.get(ep);
+                          if (cur == null || c.score > cur.score
+                                  || (c.score == cur.score && c.dir.length() < cur.dir.length())) {
+                              best.put(ep, c);
+                          }
+                      }
+                      if (best.isEmpty()) {
+                          throw new IOException("El ZIP no contiene ningún ejecutable de Commander Keen");
+                      }
+
+                      Map<String, Integer> dirCount = new HashMap<String, Integer>();
+                      for (Cand c : best.values()) {
+                          Integer n = dirCount.get(c.dir);
+                          dirCount.put(c.dir, n == null ? 1 : n + 1);
+                      }
+
+                      Map<Integer, String> result = new TreeMap<Integer, String>();
+                      int done = 0;
+                      byte[] buf = new byte[128 * 1024];
+                      for (Cand c : best.values()) {
+                          if (progress != null) {
+                              progress.update("Importando episodio " + c.ep + ": " + TITLES[c.ep],
+                                      done * 100 / best.size());
+                          }
+                          boolean shared = dirCount.get(c.dir) > 1;
+                          File tmp = new File(outDir, "ep" + c.ep + ".zip.tmp");
+                          File dst = new File(outDir, "ep" + c.ep + ".zip");
+                          int others = 0;
+                          boolean hasData = false;
+                          ZipOutputStream zo = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(tmp)));
+                          try {
+                              for (int j = 0; j < paths.size(); j++) {
+                                  String p = paths.get(j);
+                                  if (!c.dir.isEmpty() && !p.startsWith(c.dir)) {
+                                      continue;
+                                  }
+                                  String rel = p.substring(c.dir.length());
+                                  if (rel.isEmpty()) {
+                                      continue;
+                                  }
+                                  if (shared && !belongs(c.ep, rel, best)) {
+                                      continue;
+                                  }
+                                  zo.putNextEntry(new ZipEntry(rel));
+                                  InputStream in = zf.getInputStream(files.get(j));
+                                  try {
+                                      int n;
+                                      while ((n = in.read(buf)) != -1) {
+                                          zo.write(buf, 0, n);
+                                      }
+                                  } finally {
+                                      in.close();
+                                  }
+                                  zo.closeEntry();
+                                  if (!rel.equalsIgnoreCase(c.base)) {
+                                      others++;
+                                      Matcher m = CK_EXT.matcher(rel.toLowerCase(Locale.ROOT));
+                                      if (m.find() && Integer.parseInt(m.group(1)) == c.ep) {
+                                          hasData = true;
+                                      }
+                                  }
+                              }
+                          } finally {
+                              zo.close();
+                          }
+                          boolean valid = c.ep <= 6 ? hasData : others > 0;
+                          if (!valid) {
+                              tmp.delete();
+                              done++;
+                              continue;
+                          }
+                          if (dst.exists() && !dst.delete()) {
+                              throw new IOException("No se pudo reemplazar " + dst.getName());
+                          }
+                          if (!tmp.renameTo(dst)) {
+                              throw new IOException("No se pudo guardar " + dst.getName());
+                          }
+                          result.put(c.ep, c.base);
+                          done++;
+                      }
+                      if (result.isEmpty()) {
+                          throw new IOException("Se encontraron ejecutables, pero faltan los archivos de datos de los juegos");
+                      }
+
+                      StringBuilder sb = new StringBuilder("{");
+                      boolean first = true;
+                      for (Map.Entry<Integer, String> e : result.entrySet()) {
+                          if (!first) {
+                              sb.append(',');
+                          }
+                          first = false;
+                          sb.append('"').append(e.getKey()).append("\":\"")
+                                  .append(e.getValue().replace("\\", "").replace("\"", "")).append('"');
+                      }
+                      sb.append('}');
+                      OutputStream mo = new FileOutputStream(new File(outDir, "games.json"));
+                      try {
+                          mo.write(sb.toString().getBytes(StandardCharsets.UTF_8));
+                      } finally {
+                          mo.close();
+                      }
+                      if (progress != null) {
+                          progress.update("Listo", 100);
+                      }
+                      return result;
+                  } finally {
+                      zf.close();
+                  }
+              }
+
+              /** Returns the manifest JSON object text ("{}" when nothing is installed). */
+              static String readManifest(File outDir) {
+                  File f = new File(outDir, "games.json");
+                  if (!f.isFile()) {
+                      return "{}";
+                  }
+                  try {
+                      java.io.FileInputStream in = new java.io.FileInputStream(f);
+                      try {
+                          java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                          byte[] b = new byte[4096];
+                          int n;
+                          while ((n = in.read(b)) != -1) {
+                              bo.write(b, 0, n);
+                          }
+                          String s = new String(bo.toByteArray(), StandardCharsets.UTF_8).trim();
+                          return s.startsWith("{") && s.endsWith("}") ? s : "{}";
+                      } finally {
+                          in.close();
+                      }
+                  } catch (IOException e) {
+                      return "{}";
+                  }
+              }
+          }
+          __KEEN_EOF__
+          cat > android/app/src/main/java/com/elpollopaco/commanderkeen/MainActivity.java <<'__KEEN_EOF__'
+          package com.elpollopaco.commanderkeen;
 
           import android.app.Activity;
+          import android.content.Context;
           import android.content.Intent;
-          import android.content.pm.ActivityInfo;
-          import android.content.pm.PackageInfo;
-          import android.content.pm.PackageManager;
           import android.database.Cursor;
           import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
-          import android.os.Handler;
-          import android.os.Looper;
           import android.provider.OpenableColumns;
-          import android.view.Gravity;
+          import android.util.Log;
           import android.view.View;
-          import android.widget.Button;
-          import android.widget.LinearLayout;
-          import android.widget.ProgressBar;
-          import android.widget.TextView;
+          import android.view.WindowManager;
+          import android.view.inputmethod.InputMethodManager;
+          import android.webkit.ConsoleMessage;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebStorage;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
 
-          import java.io.BufferedInputStream;
+          import androidx.webkit.WebViewAssetLoader;
+
+          import org.json.JSONObject;
+
+          import java.io.BufferedOutputStream;
           import java.io.File;
-          import java.io.FileInputStream;
           import java.io.FileOutputStream;
-          import java.io.FilterInputStream;
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
           import java.security.MessageDigest;
-          import java.util.ArrayList;
-          import java.util.HashSet;
-          import java.util.List;
-          import java.util.Locale;
-          import java.util.Set;
-          import java.util.zip.ZipEntry;
-          import java.util.zip.ZipInputStream;
 
-          @android.annotation.TargetApi(19)
-          public class ImportActivity extends Activity {
+          public class MainActivity extends Activity {
 
-              // ===================== CONFIGURACION HARDCODEADA =====================
-              private static final String EXPECTED_SHA256 =
+              /** SHA-256 of the ZIP with the games (the only one the app accepts). */
+              static final String EXPECTED_SHA256 =
                       "163f6742469a6ce9ec9e1f28a22cfcc377127ac276c3431555727ff693ba769e";
-              private static final String GAMES_SUBDIR = "games";
-              private static final String MARKER_FILE = "keen_zip_import.txt";
-              private static final String TMP_DIR = "keen_import_tmp";
-              private static final long MAX_EXTRACT_BYTES = 1024L * 1024L * 1024L;
-              private static final int REQ_PICK = 4242;
-              // =====================================================================
 
-              private final Handler ui = new Handler(Looper.getMainLooper());
-              private TextView status;
-              private ProgressBar bar;
-              private Button pick;
-              private boolean working = false;
-              private long lastPost = 0;
+              private static final String TAG = "CommanderKeen";
+              private static final String START_URL = "https://appassets.androidplatform.net/assets/www/index.html";
+              private static final int REQ_ZIP = 4242;
+
+              private WebView web;
+              private File gamesDir;
+              private WebViewAssetLoader loader;
+              private volatile boolean importing = false;
 
               @Override
-              protected void onCreate(Bundle b) {
-                  super.onCreate(b);
-                  File base = getExternalFilesDir(null);
-                  if (base != null && alreadyImported(base)) {
-                      launchGame();
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      WindowManager.LayoutParams lp = getWindow().getAttributes();
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                      getWindow().setAttributes(lp);
+                  }
+
+                  gamesDir = new File(getFilesDir(), "games");
+                  gamesDir.mkdirs();
+
+                  loader = new WebViewAssetLoader.Builder()
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .addPathHandler("/games/", new WebViewAssetLoader.InternalStoragePathHandler(this, gamesDir))
+                          .build();
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(0xFF000000);
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(false);
+                  s.setSupportZoom(false);
+                  s.setBuiltInZoomControls(false);
+
+                  web.addJavascriptInterface(new Bridge(), "Android");
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          return loader.shouldInterceptRequest(request.getUrl());
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onConsoleMessage(ConsoleMessage m) {
+                          Log.d(TAG, m.message() + " (" + m.sourceId() + ":" + m.lineNumber() + ")");
+                          return true;
+                      }
+                  });
+                  web.loadUrl(START_URL);
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) {
+                      hideSystemUi();
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              private void hideSystemUi() {
+                  getWindow().getDecorView().setSystemUiVisibility(
+                          View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                                  | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                                  | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                  | View.SYSTEM_UI_FLAG_FULLSCREEN
+                                  | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  web.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (web != null) {
+                      web.destroy();
+                  }
+                  super.onDestroy();
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onBackPressed() {
+                  web.evaluateJavascript("(window.__back ? window.__back() : false)", new ValueCallback<String>() {
+                      @Override
+                      public void onReceiveValue(String value) {
+                          if (!"true".equals(value)) {
+                              finish();
+                          }
+                      }
+                  });
+              }
+
+              @Override
+              @SuppressWarnings("deprecation")
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode != REQ_ZIP) {
                       return;
                   }
-                  buildUi();
-              }
-
-              private void buildUi() {
-                  LinearLayout root = new LinearLayout(this);
-                  root.setOrientation(LinearLayout.VERTICAL);
-                  root.setGravity(Gravity.CENTER);
-                  int pad = (int) (24 * getResources().getDisplayMetrics().density);
-                  root.setPadding(pad, pad, pad, pad);
-
-                  TextView title = new TextView(this);
-                  title.setText("Commander Keen");
-                  title.setTextSize(26);
-                  title.setGravity(Gravity.CENTER);
-
-                  TextView info = new TextView(this);
-                  info.setText("Selecciona el ZIP con los juegos. Se verificará y se copiará a la app; "
-                          + "después ya no necesitarás el ZIP.");
-                  info.setGravity(Gravity.CENTER);
-                  info.setPadding(0, pad, 0, pad);
-
-                  pick = new Button(this);
-                  pick.setText("Seleccionar ZIP");
-                  pick.setOnClickListener(new View.OnClickListener() {
-                      @Override
-                      public void onClick(View v) {
-                          pickZip();
-                      }
-                  });
-
-                  bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-                  bar.setMax(1000);
-
-                  status = new TextView(this);
-                  status.setGravity(Gravity.CENTER);
-                  status.setPadding(0, pad, 0, 0);
-
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                  root.addView(title, lp);
-                  root.addView(info, lp);
-                  root.addView(pick, lp);
-                  root.addView(bar, lp);
-                  root.addView(status, lp);
-                  setContentView(root);
-              }
-
-              private void pickZip() {
-                  if (working) return;
-                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                  i.addCategory(Intent.CATEGORY_OPENABLE);
-                  i.setType("*/*");
-                  i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
-                          "application/zip", "application/x-zip-compressed", "application/octet-stream"
-                  });
-                  startActivityForResult(i, REQ_PICK);
-              }
-
-              @Override
-              protected void onActivityResult(int req, int res, Intent data) {
-                  super.onActivityResult(req, res, data);
-                  if (req == REQ_PICK && res == RESULT_OK && data != null && data.getData() != null) {
+                  if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                       startImport(data.getData());
+                  } else {
+                      js("window.onImport && window.onImport({state:'cancel'})");
                   }
               }
 
-              private void startImport(final Uri uri) {
-                  if (working) return;
-                  working = true;
-                  pick.setEnabled(false);
-                  new Thread(new Runnable() {
+              // ---------------------------------------------------------------- helpers
+
+              private void js(final String code) {
+                  runOnUiThread(new Runnable() {
                       @Override
                       public void run() {
-                          File tmp = null;
-                          try {
-                              File base = getExternalFilesDir(null);
-                              if (base == null) throw new IOException("Almacenamiento de la app no disponible");
-                              long total = querySize(uri);
-
-                              String got = sha256(uri, total);
-                              if (!got.equalsIgnoreCase(EXPECTED_SHA256)) {
-                                  fail("El ZIP no coincide con el esperado.\nSHA-256 obtenido:\n" + got);
-                                  return;
-                              }
-
-                              tmp = new File(base, TMP_DIR);
-                              deleteRec(tmp);
-                              tmp.mkdirs();
-                              extract(uri, tmp, total);
-
-                              progress("Añadiendo juegos a la colección...", 1, 1);
-                              int n = installGames(tmp, new File(base, GAMES_SUBDIR));
-                              deleteRec(tmp);
-                              if (n == 0) {
-                                  fail("No se encontraron juegos dentro del ZIP.");
-                                  return;
-                              }
-                              writeText(new File(base, MARKER_FILE), EXPECTED_SHA256);
-                              done(n);
-                          } catch (Throwable t) {
-                              if (tmp != null) deleteRec(tmp);
-                              fail("Error: " + t.getMessage());
+                          if (web != null) {
+                              web.evaluateJavascript(code, null);
                           }
                       }
-                  }).start();
-              }
-
-              // ----------------------------- UI helpers --------------------------
-              private void progress(final String text, final long done, final long total) {
-                  long now = System.currentTimeMillis();
-                  if (now - lastPost < 120 && done < total) return;
-                  lastPost = now;
-                  final int p = total > 0 ? (int) Math.min(1000L, done * 1000L / total) : 0;
-                  final boolean indet = total <= 0;
-                  ui.post(new Runnable() {
-                      @Override
-                      public void run() {
-                          status.setText(text);
-                          bar.setIndeterminate(indet);
-                          if (!indet) bar.setProgress(p);
-                      }
                   });
               }
 
-              private void fail(final String msg) {
-                  ui.post(new Runnable() {
-                      @Override
-                      public void run() {
-                          working = false;
-                          bar.setIndeterminate(false);
-                          bar.setProgress(0);
-                          status.setText(msg);
-                          pick.setEnabled(true);
-                      }
-                  });
-              }
+              private int lastPct = -1;
+              private String lastText = "";
 
-              private void done(final int n) {
-                  ui.post(new Runnable() {
-                      @Override
-                      public void run() {
-                          bar.setIndeterminate(false);
-                          bar.setProgress(1000);
-                          status.setText("Listo: " + n + " juego(s) añadidos a la colección.");
-                      }
-                  });
-                  ui.postDelayed(new Runnable() {
-                      @Override
-                      public void run() {
-                          launchGame();
-                      }
-                  }, 900);
-              }
-
-              private void launchGame() {
+              private void progress(String text, int pct) {
+                  if (pct == lastPct && text.equals(lastText)) {
+                      return;
+                  }
+                  lastPct = pct;
+                  lastText = text;
                   try {
-                      PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(),
-                              PackageManager.GET_ACTIVITIES);
-                      String target = null;
-                      if (pi.activities != null) {
-                          for (ActivityInfo ai : pi.activities) {
-                              if (ai.name != null && ai.name.endsWith("MainActivity")) {
-                                  target = ai.name;
-                                  break;
-                              }
-                          }
-                      }
-                      if (target == null) throw new Exception("MainActivity no encontrada");
-                      Intent i = new Intent();
-                      i.setClassName(getPackageName(), target);
-                      startActivity(i);
-                      finish();
-                  } catch (Exception e) {
-                      if (status != null) status.setText("No se pudo iniciar el juego: " + e.getMessage());
+                      JSONObject o = new JSONObject();
+                      o.put("state", "progress");
+                      o.put("text", text);
+                      o.put("pct", pct);
+                      js("window.onImport && window.onImport(" + o.toString() + ")");
+                  } catch (Exception ignored) {
                   }
               }
 
-              // ----------------------------- Logica de ZIP -----------------------
-              private boolean alreadyImported(File base) {
+              private void fail(String message) {
                   try {
-                      File m = new File(base, MARKER_FILE);
-                      if (!m.isFile()) return false;
-                      if (!readText(m).trim().equalsIgnoreCase(EXPECTED_SHA256)) return false;
-                      File games = new File(base, GAMES_SUBDIR);
-                      File[] fs = games.listFiles();
-                      if (fs == null) return false;
-                      for (File f : fs) if (f.isDirectory()) return true;
-                      return false;
-                  } catch (Exception e) {
-                      return false;
+                      JSONObject o = new JSONObject();
+                      o.put("state", "error");
+                      o.put("text", message);
+                      js("window.onImport && window.onImport(" + o.toString() + ")");
+                  } catch (Exception ignored) {
                   }
+              }
+
+              private void finished() {
+                  js("window.onImport && window.onImport({state:'done'})");
               }
 
               private long querySize(Uri uri) {
                   Cursor c = null;
                   try {
-                      c = getContentResolver().query(uri, new String[] { OpenableColumns.SIZE }, null, null, null);
-                      if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getLong(0);
-                  } catch (Exception e) {
-                      // sin tamaño: barra indeterminada
+                      c = getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null);
+                      if (c != null && c.moveToFirst()) {
+                          int idx = c.getColumnIndex(OpenableColumns.SIZE);
+                          if (idx >= 0 && !c.isNull(idx)) {
+                              return c.getLong(idx);
+                          }
+                      }
+                  } catch (Exception ignored) {
                   } finally {
-                      if (c != null) c.close();
+                      if (c != null) {
+                          c.close();
+                      }
                   }
                   return -1;
               }
 
-              private String sha256(Uri uri, long total) throws Exception {
-                  MessageDigest md = MessageDigest.getInstance("SHA-256");
-                  InputStream in = getContentResolver().openInputStream(uri);
-                  if (in == null) throw new IOException("No se pudo abrir el archivo");
-                  try {
-                      byte[] buf = new byte[65536];
-                      long done = 0;
-                      int n;
-                      while ((n = in.read(buf)) != -1) {
-                          md.update(buf, 0, n);
-                          done += n;
-                          progress("Verificando ZIP...", done, total);
-                      }
-                  } finally {
-                      in.close();
+              private static String toHex(byte[] b) {
+                  StringBuilder sb = new StringBuilder(b.length * 2);
+                  for (int i = 0; i < b.length; i++) {
+                      sb.append(String.format("%02x", b[i] & 0xff));
                   }
-                  StringBuilder sb = new StringBuilder();
-                  for (byte x : md.digest()) sb.append(String.format(Locale.ROOT, "%02x", x));
                   return sb.toString();
               }
 
-              private static class CountingIn extends FilterInputStream {
-                  long count = 0;
-
-                  CountingIn(InputStream in) {
-                      super(in);
+              private void startImport(final Uri uri) {
+                  if (importing) {
+                      return;
                   }
-
-                  @Override
-                  public int read() throws IOException {
-                      int b = super.read();
-                      if (b >= 0) count++;
-                      return b;
-                  }
-
-                  @Override
-                  public int read(byte[] b, int o, int l) throws IOException {
-                      int n = super.read(b, o, l);
-                      if (n > 0) count += n;
-                      return n;
-                  }
-              }
-
-              private void extract(Uri uri, File dest, long total) throws Exception {
-                  InputStream raw = getContentResolver().openInputStream(uri);
-                  if (raw == null) throw new IOException("No se pudo abrir el archivo");
-                  CountingIn cin = new CountingIn(raw);
-                  ZipInputStream zin = new ZipInputStream(new BufferedInputStream(cin, 65536));
-                  String root = dest.getCanonicalPath() + File.separator;
-                  byte[] buf = new byte[65536];
-                  long written = 0;
-                  try {
-                      ZipEntry e;
-                      while ((e = zin.getNextEntry()) != null) {
-                          String name = e.getName().replace('\\', '/');
-                          while (name.startsWith("/")) name = name.substring(1);
-                          if (name.length() == 0 || name.startsWith("__MACOSX/") || name.contains("/__MACOSX/")) {
-                              continue;
-                          }
-                          File out = new File(dest, name);
-                          if (!out.getCanonicalPath().startsWith(root)) {
-                              throw new IOException("Ruta inválida en el ZIP: " + name);
-                          }
-                          if (e.isDirectory() || name.endsWith("/")) {
-                              out.mkdirs();
-                              continue;
-                          }
-                          File parent = out.getParentFile();
-                          if (parent != null) parent.mkdirs();
-                          OutputStream os = new FileOutputStream(out);
+                  importing = true;
+                  lastPct = -1;
+                  lastText = "";
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          File tmp = new File(getCacheDir(), "import.zip");
                           try {
-                              int n;
-                              while ((n = zin.read(buf)) != -1) {
-                                  written += n;
-                                  if (written > MAX_EXTRACT_BYTES) {
-                                      throw new IOException("El ZIP descomprimido es demasiado grande");
-                                  }
-                                  os.write(buf, 0, n);
-                                  progress("Copiando juegos...", cin.count, total);
-                              }
+                              doImport(uri, tmp);
+                          } catch (Throwable t) {
+                              Log.e(TAG, "import failed", t);
+                              String msg = t.getMessage();
+                              fail(msg == null || msg.length() == 0 ? t.getClass().getSimpleName() : msg);
                           } finally {
-                              os.close();
+                              tmp.delete();
+                              importing = false;
+                          }
+                      }
+                  }, "keen-import").start();
+              }
+
+              private void doImport(Uri uri, File tmp) throws Exception {
+                  progress("Leyendo el ZIP...", 0);
+                  long total = querySize(uri);
+                  MessageDigest md = MessageDigest.getInstance("SHA-256");
+                  InputStream is = getContentResolver().openInputStream(uri);
+                  if (is == null) {
+                      throw new IOException("No se pudo abrir el archivo elegido");
+                  }
+                  OutputStream os = new BufferedOutputStream(new FileOutputStream(tmp));
+                  try {
+                      byte[] buf = new byte[256 * 1024];
+                      long done = 0;
+                      int n;
+                      while ((n = is.read(buf)) != -1) {
+                          md.update(buf, 0, n);
+                          os.write(buf, 0, n);
+                          done += n;
+                          if (total > 0) {
+                              progress("Verificando el ZIP...", (int) (done * 40 / total));
                           }
                       }
                   } finally {
-                      zin.close();
-                  }
-              }
-
-              private boolean hasExe(File dir) {
-                  File[] fs = dir.listFiles();
-                  if (fs == null) return false;
-                  for (File f : fs) {
-                      if (f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".exe")) return true;
-                  }
-                  return false;
-              }
-
-              private void findGameDirs(File dir, List<File> out) {
-                  if (hasExe(dir)) {
-                      out.add(dir);
-                      return;
-                  }
-                  File[] fs = dir.listFiles();
-                  if (fs == null) return;
-                  for (File f : fs) if (f.isDirectory()) findGameDirs(f, out);
-              }
-
-              private int installGames(File tmp, File games) throws IOException {
-                  List<File> found = new ArrayList<File>();
-                  findGameDirs(tmp, found);
-                  if (found.isEmpty()) {
-                      File[] top = tmp.listFiles();
-                      if (top != null) for (File f : top) if (f.isDirectory()) found.add(f);
-                  }
-                  if (found.isEmpty()) return 0;
-                  games.mkdirs();
-                  Set<String> used = new HashSet<String>();
-                  int n = 0;
-                  for (File d : found) {
-                      String name = d.equals(tmp) ? "Keen" : d.getName();
-                      String unique = name;
-                      int k = 2;
-                      while (used.contains(unique.toLowerCase(Locale.ROOT))) unique = name + "_" + (k++);
-                      used.add(unique.toLowerCase(Locale.ROOT));
-                      File dest = new File(games, unique);
-                      deleteRec(dest);
-                      if (!d.renameTo(dest)) {
-                          copyRec(d, dest);
-                          deleteRec(d);
-                      }
-                      n++;
-                  }
-                  return n;
-              }
-
-              private static void deleteRec(File f) {
-                  if (f == null || !f.exists()) return;
-                  File[] fs = f.listFiles();
-                  if (fs != null) for (File c : fs) deleteRec(c);
-                  f.delete();
-              }
-
-              private static void copyRec(File src, File dst) throws IOException {
-                  if (src.isDirectory()) {
-                      dst.mkdirs();
-                      File[] fs = src.listFiles();
-                      if (fs != null) for (File c : fs) copyRec(c, new File(dst, c.getName()));
-                      return;
-                  }
-                  InputStream in = new FileInputStream(src);
-                  try {
-                      OutputStream os = new FileOutputStream(dst);
                       try {
-                          byte[] buf = new byte[65536];
-                          int n;
-                          while ((n = in.read(buf)) != -1) os.write(buf, 0, n);
-                      } finally {
-                          os.close();
+                          is.close();
+                      } catch (IOException ignored) {
                       }
-                  } finally {
-                      in.close();
-                  }
-              }
-
-              private static void writeText(File f, String s) throws IOException {
-                  OutputStream os = new FileOutputStream(f);
-                  try {
-                      os.write(s.getBytes("UTF-8"));
-                  } finally {
                       os.close();
                   }
+
+                  String hex = toHex(md.digest());
+                  if (!hex.equalsIgnoreCase(EXPECTED_SHA256)) {
+                      fail("Este ZIP no es el correcto: su SHA-256 no coincide con el esperado. Se ha descartado.");
+                      return;
+                  }
+
+                  progress("ZIP verificado. Importando juegos...", 40);
+                  File[] old = gamesDir.listFiles();
+                  if (old != null) {
+                      for (File f : old) {
+                          f.delete();
+                      }
+                  }
+                  KeenImporter.importZip(tmp, gamesDir, new KeenImporter.Progress() {
+                      @Override
+                      public void update(String text, int percent) {
+                          progress(text, 40 + percent * 60 / 100);
+                      }
+                  });
+                  finished();
               }
 
-              private static String readText(File f) throws IOException {
-                  InputStream in = new FileInputStream(f);
-                  try {
-                      byte[] buf = new byte[512];
-                      int n = in.read(buf);
-                      return n > 0 ? new String(buf, 0, n, "UTF-8") : "";
-                  } finally {
-                      in.close();
+              // ----------------------------------------------------------- JS bridge
+
+              private final class Bridge {
+
+                  @JavascriptInterface
+                  public String getState() {
+                      try {
+                          JSONObject o = new JSONObject();
+                          o.put("games", new JSONObject(KeenImporter.readManifest(gamesDir)));
+                          o.put("busy", importing);
+                          o.put("hash", EXPECTED_SHA256);
+                          return o.toString();
+                      } catch (Exception e) {
+                          return "{\"games\":{},\"busy\":false,\"hash\":\"\"}";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void pickZip() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          @SuppressWarnings("deprecation")
+                          public void run() {
+                              if (importing) {
+                                  return;
+                              }
+                              try {
+                                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                                  i.setType("*/*");
+                                  startActivityForResult(i, REQ_ZIP);
+                              } catch (Exception e) {
+                                  try {
+                                      Intent g = new Intent(Intent.ACTION_GET_CONTENT);
+                                      g.addCategory(Intent.CATEGORY_OPENABLE);
+                                      g.setType("*/*");
+                                      startActivityForResult(g, REQ_ZIP);
+                                  } catch (Exception e2) {
+                                      fail("No hay ninguna app para elegir archivos en este dispositivo");
+                                  }
+                              }
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void deleteGames() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              File[] fs = gamesDir.listFiles();
+                              if (fs != null) {
+                                  for (File f : fs) {
+                                      f.delete();
+                                  }
+                              }
+                              try {
+                                  WebStorage.getInstance().deleteAllData();
+                              } catch (Exception ignored) {
+                              }
+                              web.loadUrl(START_URL);
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void showKeyboard(final boolean show) {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                              if (imm == null) {
+                                  return;
+                              }
+                              if (show) {
+                                  web.requestFocus();
+                                  imm.showSoftInput(web, InputMethodManager.SHOW_IMPLICIT);
+                              } else {
+                                  imm.hideSoftInputFromWindow(web.getWindowToken(), 0);
+                              }
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void quit() {
+                      runOnUiThread(new Runnable() {
+                          @Override
+                          public void run() {
+                              finish();
+                          }
+                      });
                   }
               }
           }
-          JAVA_EOF
+          __KEEN_EOF__
 
-          cat > patch_manifest.py <<'PY_EOF'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          ANDROID = "http://schemas.android.com/apk/res/android"
-          ET.register_namespace("android", ANDROID)
-          ET.register_namespace("tools", "http://schemas.android.com/tools")
-
-
-          def a(n):
-              return "{%s}%s" % (ANDROID, n)
-
-
-          path, pkg = sys.argv[1], sys.argv[2]
-          tree = ET.parse(path)
-          root = tree.getroot()
-          app = root.find("application")
-          if app is None:
-              sys.exit("No hay <application> en " + path)
-
-          main = None
-          for act in app.findall("activity"):
-              if act.get(a("name"), "").endswith("MainActivity"):
-                  main = act
-          if main is None:
-              sys.exit("MainActivity no encontrada en " + path)
-
-          # MainActivity deja de ser la pantalla de inicio (se lanza desde ImportActivity)
-          for f in list(main.findall("intent-filter")):
-              names = [x.get(a("name")) for x in f.findall("action")]
-              if "android.intent.action.MAIN" in names:
-                  main.remove(f)
-
-          full = pkg + ".ImportActivity"
-          if not any(x.get(a("name")) == full for x in app.findall("activity")):
-              imp = ET.SubElement(app, "activity")
-              imp.set(a("name"), full)
-              imp.set(a("exported"), "true")
-              imp.set(a("theme"), "@android:style/Theme.DeviceDefault.NoActionBar")
-              imp.set(a("configChanges"), "orientation|screenSize|keyboardHidden")
-              f = ET.SubElement(imp, "intent-filter")
-              ET.SubElement(f, "action").set(a("name"), "android.intent.action.MAIN")
-              ET.SubElement(f, "category").set(a("name"), "android.intent.category.LAUNCHER")
-
-          tree.write(path, encoding="utf-8", xml_declaration=True)
-          print("manifest parcheado:", path, "->", full)
-          PY_EOF
-
-          cat > check_apk.py <<'CHECK_EOF'
-          import sys
-          import zipfile
-
-          apk = sys.argv[1]
-          z = zipfile.ZipFile(apk)
-          names = z.namelist()
-
-
-          def has(data, s):
-              return s.encode() in data or s.encode("utf-16-le") in data
-
-
-          man = z.read("AndroidManifest.xml") if "AndroidManifest.xml" in names else b""
-          ok_manifest = has(man, "ImportActivity")
-          dex = [n for n in names if n.startswith("classes") and n.endswith(".dex")]
-          ok_dex = any(has(z.read(n), "ImportActivity") for n in dex)
-          print("%s: manifest=%s dex=%s" % (apk, "OK" if ok_manifest else "FALTA", "OK" if ok_dex else "FALTA"))
-          if not (ok_manifest and ok_dex):
-              print("ERROR: el APK no incluye ImportActivity (la inyeccion se perdio durante la compilacion)")
-              sys.exit(1)
-          CHECK_EOF
-
-          cat > inject.sh <<'INJECT_EOF'
-          #!/usr/bin/env bash
-          # Se ejecuta SIEMPRE justo despues de changeAppSettings.sh (que regenera project/src y el manifest)
+      - name: Crear interfaz web (menu, controles, DOSBox)
+        run: |
           set -euo pipefail
-          cd "$KEEN_CG"
+          cat > android/app/src/main/assets/www/index.html <<'__KEEN_EOF__'
+          <!DOCTYPE html>
+          <html lang="es">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+          <title>Commander Keen</title>
+          <style>
+          :root{--cw:960px;--ch:720px;--yel:#ffd400;--blue:#0000aa;--cyan:#55ffff;--mag:#ff55ff}
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+          html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;touch-action:manipulation}
+          button{font-family:inherit;color:#fff}
 
-          CFG=AndroidAppSettings.cfg
-          PKG="$(grep -m1 '^AppFullName=' "$CFG" | sed 's/^AppFullName=//; s/"//g' | tr -d '\r ' || true)"
-          [ -n "$PKG" ] || { echo "inject: no se pudo leer AppFullName de $CFG"; exit 1; }
+          /* ---------- menu ---------- */
+          #menu{position:fixed;inset:0;overflow-y:auto;-webkit-overflow-scrolling:touch;display:none;
+            padding:max(2.5vh,env(safe-area-inset-top)) max(3vw,env(safe-area-inset-right)) 3vh max(3vw,env(safe-area-inset-left));
+            background:linear-gradient(180deg,#00006e 0%,#000030 100%)}
+          #menu header{text-align:center;margin-bottom:1.6vh}
+          #menu h1{margin:0;font-size:min(7vh,36px);letter-spacing:.12em;color:var(--yel);text-shadow:3px 3px 0 #aa0000}
+          #menu .sub{margin-top:.6vh;font-size:min(3.2vh,15px);color:var(--cyan)}
+          #grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1.8vh 1.6vw;max-width:1100px;margin:0 auto}
+          .card{border:3px solid var(--cyan);border-radius:10px;background:#0000aa;padding:1.4vh 1vw;text-align:left;
+            min-height:min(21vh,120px);display:flex;flex-direction:column;justify-content:space-between;cursor:pointer}
+          .card:active{background:#2222dd}
+          .card .num{font-size:min(7vh,34px);font-weight:800;color:var(--yel);line-height:1}
+          .card .ct{font-size:min(3.4vh,16px);font-weight:700;line-height:1.15}
+          .card .cs{font-size:min(2.7vh,12px);color:var(--cyan);opacity:.9}
+          .card.off{opacity:.35;border-color:#777;cursor:default}
+          .row{display:flex;flex-wrap:wrap;gap:1.4vw;justify-content:center;margin:2.2vh auto 0;max-width:1100px}
+          .pbtn{border:3px solid #fff;border-radius:10px;background:#aa0000;padding:1.3vh 2.2vw;font-size:min(3.6vh,17px);font-weight:700}
+          .pbtn.big{background:#00aa00;font-size:min(4.4vh,20px);padding:1.8vh 3vw}
+          .pbtn.alt{background:#444;border-color:#999;font-size:min(3.2vh,14px)}
+          .pbtn:active{filter:brightness(1.3)}
+          #info{max-width:900px;margin:1.6vh auto 0;text-align:center;font-size:min(3vh,13px);line-height:1.4;color:#cfe}
+          #hash{font-family:monospace;color:var(--mag);word-break:break-all}
 
-          # ---------- 1) ImportActivity.java junto a MainActivity.java ----------
-          MAIN_JAVA="$(find project/src -name MainActivity.java 2>/dev/null | head -n1 || true)"
-          if [ -z "$MAIN_JAVA" ]; then
-            MAIN_JAVA="$(find project -name MainActivity.java -not -path '*/jni/*' -not -path '*/build/*' 2>/dev/null | head -n1 || true)"
+          /* ---------- overlays ---------- */
+          .ov{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,20,.92);z-index:100;padding:4vw}
+          .box{background:#0000aa;border:3px solid var(--cyan);border-radius:12px;padding:3vh 3vw;max-width:640px;width:100%;text-align:center}
+          .box p{margin:0 0 2vh;font-size:min(3.6vh,17px);line-height:1.35;white-space:pre-wrap}
+          .bar{height:2.2vh;min-height:12px;background:#000;border:2px solid #fff;border-radius:8px;overflow:hidden;margin:1vh 0 2vh}
+          .bar i{display:block;height:100%;width:0;background:var(--yel)}
+
+          /* ---------- game ---------- */
+          #game{position:fixed;inset:0;background:#000;display:none;touch-action:none}
+          canvas#jsdos{position:fixed!important;left:50%!important;top:50%!important;right:auto!important;bottom:auto!important;
+            transform:translate(-50%,-50%)!important;width:var(--cw)!important;height:var(--ch)!important;margin:0!important;
+            z-index:1!important;background:#000}
+          .dosbox-overlay,.dosbox-powered,.dosbox-start,.dosbox-loader{display:none!important}
+          #controls{position:fixed;inset:0;z-index:20;pointer-events:none}
+          #controls>*{pointer-events:auto;touch-action:none}
+          #dpad{position:fixed;left:max(3vw,env(safe-area-inset-left));bottom:5vh;width:min(40vh,30vw);height:min(40vh,30vw);
+            border-radius:50%;background:rgba(255,255,255,.10);border:2px solid rgba(255,255,255,.35)}
+          #dpad b{position:absolute;display:flex;align-items:center;justify-content:center;width:34%;height:34%;
+            font-size:min(7vh,5vw);color:rgba(255,255,255,.55);pointer-events:none}
+          #dpad b.on{color:var(--yel);text-shadow:0 0 10px var(--yel)}
+          #dU{left:33%;top:2%}#dD{left:33%;bottom:2%}#dL{left:2%;top:33%}#dR{right:2%;top:33%}
+          #btns{position:fixed;right:max(3vw,env(safe-area-inset-right));bottom:5vh;width:min(46vh,34vw);height:min(46vh,34vw);
+            display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:5%}
+          .gb{border-radius:50%;border:2px solid rgba(255,255,255,.45);background:rgba(255,255,255,.12);
+            display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.1;color:#fff}
+          .gb b{font-size:min(4vh,2.8vw)}
+          .gb i{font-style:normal;font-size:min(2.6vh,1.8vw);opacity:.8}
+          .gb.on{background:rgba(255,212,0,.55);border-color:var(--yel)}
+          .gb.hide{visibility:hidden}
+          #top{position:fixed;top:max(1.5vh,env(safe-area-inset-top));left:max(2vw,env(safe-area-inset-left));right:max(2vw,env(safe-area-inset-right));
+            display:flex;justify-content:space-between;z-index:30;pointer-events:none}
+          #top div{display:flex;gap:1vw}
+          .tb{pointer-events:auto;touch-action:none;min-width:min(9vh,60px);height:min(8vh,48px);padding:0 1.2vw;border-radius:10px;
+            border:2px solid rgba(255,255,255,.45);background:rgba(0,0,0,.35);font-size:min(3.4vh,16px);font-weight:700}
+          .tb.on{background:rgba(255,212,0,.55);border-color:var(--yel)}
+          #pause .box .pbtn{display:block;width:100%;margin:0 0 1.6vh}
+          #keys{display:flex;flex-wrap:wrap;gap:1vw;justify-content:center;margin-bottom:1.6vh}
+          #keys .tb{pointer-events:auto}
+          #kb{position:fixed;left:-200px;top:0;width:20px;height:20px;opacity:0}
+          #toast{position:fixed;left:50%;bottom:3vh;transform:translateX(-50%);background:#000c;border:2px solid var(--cyan);
+            border-radius:10px;padding:1vh 2vw;z-index:200;display:none;font-size:min(3.2vh,15px)}
+          </style>
+          <script src="jsdos/js-dos.js"></script>
+          </head>
+          <body>
+
+          <div id="menu">
+            <header>
+              <h1>COMMANDER KEEN</h1>
+              <div class="sub">Episodios 1 a 7</div>
+            </header>
+            <div id="grid"></div>
+            <div class="row">
+              <button class="pbtn big" id="bImport">Importar ZIP de los juegos</button>
+              <button class="pbtn alt" id="bDelete">Borrar juegos importados</button>
+            </div>
+            <div id="info"></div>
+          </div>
+
+          <div id="game">
+            <canvas id="jsdos"></canvas>
+            <div id="controls">
+              <div id="dpad"><b id="dU">&#9650;</b><b id="dD">&#9660;</b><b id="dL">&#9664;</b><b id="dR">&#9654;</b></div>
+              <div id="btns">
+                <div class="gb" id="bFire"><b>CTRL+ALT</b><i>Disparo</i></div>
+                <div class="gb" id="bSpace"><b>ESPACIO</b><i></i></div>
+                <div class="gb" id="bPogo"><b>ALT</b><i>Pogo</i></div>
+                <div class="gb" id="bJump"><b>CTRL</b><i>Saltar</i></div>
+              </div>
+              <div id="top">
+                <div><button class="tb" id="tMenu">&#9776;</button><button class="tb" id="tKb">&#9000;</button></div>
+                <div><button class="tb" id="tEsc">ESC</button><button class="tb" id="tEnter">ENTER</button></div>
+              </div>
+            </div>
+            <input id="kb" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+          </div>
+
+          <div class="ov" id="pause">
+            <div class="box">
+              <p>Pausa / teclas extra</p>
+              <div id="keys"></div>
+              <button class="pbtn big" id="pResume">Continuar</button>
+              <button class="pbtn" id="pExit">Salir al men&uacute;</button>
+            </div>
+          </div>
+
+          <div class="ov" id="busy">
+            <div class="box">
+              <p id="busyText">...</p>
+              <div class="bar" id="busyBar"><i id="busyFill"></i></div>
+              <button class="pbtn" id="busyBtn" style="display:none">Volver al men&uacute;</button>
+            </div>
+          </div>
+
+          <div class="ov" id="confirm">
+            <div class="box">
+              <p id="confirmText"></p>
+              <button class="pbtn" id="cYes">Borrar</button>
+              <button class="pbtn alt" id="cNo">Cancelar</button>
+            </div>
+          </div>
+
+          <div id="toast"></div>
+
+          <script>
+          (function () {
+            'use strict';
+
+            var EP = [null,
+              { t: 'Marooned on Mars', s: 'Invasion of the Vorticons' },
+              { t: 'The Earth Explodes', s: 'Invasion of the Vorticons' },
+              { t: 'Keen Must Die!', s: 'Invasion of the Vorticons' },
+              { t: 'Secret of the Oracle', s: 'Goodbye, Galaxy!' },
+              { t: 'The Armageddon Machine', s: 'Goodbye, Galaxy!' },
+              { t: 'Aliens Ate My Baby Sitter!', s: 'Episodio 6' },
+              { t: 'Keen Dreams', s: 'Commander Keen in Keen Dreams' }
+            ];
+            var K = { LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40, CTRL: 17, ALT: 18, SPACE: 32, ENTER: 13,
+                      ESC: 27, F1: 112, F2: 113, F3: 114, Y: 89, N: 78, BACK: 8 };
+
+            function $(id) { return document.getElementById(id); }
+            var root = document.documentElement;
+            var ci = null;
+            var screenNow = 'menu';
+            var games = {};
+            var canvas = $('jsdos');
+
+            // ------------------------------------------------------------ helpers
+            function toast(msg) {
+              var t = $('toast');
+              t.textContent = msg;
+              t.style.display = 'block';
+              clearTimeout(toast._h);
+              toast._h = setTimeout(function () { t.style.display = 'none'; }, 3500);
+            }
+
+            function fit() {
+              var w = window.innerWidth, h = window.innerHeight;
+              var cw = Math.min(w, h * 4 / 3);
+              root.style.setProperty('--cw', Math.floor(cw) + 'px');
+              root.style.setProperty('--ch', Math.floor(cw * 3 / 4) + 'px');
+            }
+            window.addEventListener('resize', fit);
+            fit();
+
+            function show(which) {
+              screenNow = which;
+              $('menu').style.display = which === 'menu' ? 'block' : 'none';
+              $('game').style.display = which === 'game' ? 'block' : 'none';
+            }
+
+            function busy(on, text, pct, withBack) {
+              $('busy').style.display = on ? 'flex' : 'none';
+              if (!on) { return; }
+              $('busyText').textContent = text || '';
+              var bar = $('busyBar');
+              if (typeof pct === 'number' && pct >= 0) {
+                bar.style.display = 'block';
+                $('busyFill').style.width = Math.max(0, Math.min(100, pct)) + '%';
+              } else {
+                bar.style.display = 'none';
+              }
+              $('busyBtn').style.display = withBack ? 'inline-block' : 'none';
+            }
+
+            function ask(text, yesLabel, cb) {
+              $('confirmText').textContent = text;
+              $('cYes').textContent = yesLabel;
+              $('confirm').style.display = 'flex';
+              $('cYes').onclick = function () { $('confirm').style.display = 'none'; cb(); };
+              $('cNo').onclick = function () { $('confirm').style.display = 'none'; };
+            }
+
+            // ------------------------------------------------------------ menu
+            function getState() {
+              try { return JSON.parse(window.Android.getState()); } catch (e) { return { games: {}, hash: '' }; }
+            }
+
+            function render() {
+              var st = getState();
+              games = st.games || {};
+              var count = 0, n;
+              var grid = $('grid');
+              grid.innerHTML = '';
+              for (n = 1; n <= 7; n++) {
+                if (games[n]) { count++; }
+                var b = document.createElement('button');
+                b.className = 'card' + (games[n] ? '' : ' off');
+                var a = document.createElement('div'); a.className = 'num'; a.textContent = String(n);
+                var c = document.createElement('div'); c.className = 'ct'; c.textContent = EP[n].t;
+                var d = document.createElement('div'); d.className = 'cs'; d.textContent = EP[n].s;
+                b.appendChild(a); b.appendChild(c); b.appendChild(d);
+                b.disabled = !games[n];
+                b.addEventListener('click', (function (k) { return function () { launch(k); }; })(n));
+                grid.appendChild(b);
+              }
+              var h = st.hash || '';
+              var short = h ? h.substring(0, 10) + '...' + h.substring(h.length - 8) : '';
+              var info = $('info');
+              info.innerHTML = '';
+              var p1 = document.createElement('div');
+              if (count === 0) {
+                p1.textContent = 'Todav\u00eda no hay juegos. Pulsa \u00abImportar ZIP\u00bb y elige el ZIP con los juegos. ' +
+                  'La app comprueba su SHA-256 y copia los juegos dentro de la app; despu\u00e9s puedes borrar el ZIP.';
+              } else {
+                p1.textContent = count + ' de 7 episodios disponibles. Puedes borrar el ZIP original.';
+              }
+              info.appendChild(p1);
+              if (short) {
+                var p2 = document.createElement('div');
+                p2.textContent = 'SHA-256 esperado: ';
+                var sp = document.createElement('span'); sp.id = 'hash'; sp.textContent = short;
+                p2.appendChild(sp);
+                info.appendChild(p2);
+              }
+              $('bDelete').style.display = count === 0 ? 'none' : 'inline-block';
+              $('bImport').textContent = count === 0 ? 'Importar ZIP de los juegos' : 'Importar de nuevo';
+              $('bImport').className = 'pbtn ' + (count === 0 ? 'big' : 'alt');
+              show('menu');
+            }
+
+            $('bImport').addEventListener('click', function () {
+              try { window.Android.pickZip(); } catch (e) { toast('No se pudo abrir el selector de archivos'); }
+            });
+            $('bDelete').addEventListener('click', function () {
+              ask('Se borrar\u00e1n los juegos importados y tambi\u00e9n las partidas guardadas. ' +
+                  'Para volver a jugar tendr\u00e1s que importar el ZIP otra vez.', 'Borrar', function () {
+                try { window.Android.deleteGames(); } catch (e) { /* ignore */ }
+              });
+            });
+
+            window.onImport = function (o) {
+              if (!o) { return; }
+              if (o.state === 'progress') {
+                busy(true, o.text, o.pct, false);
+              } else if (o.state === 'done') {
+                busy(false);
+                render();
+                toast('Juegos importados');
+              } else if (o.state === 'error') {
+                busy(true, o.text || 'Error', -1, true);
+                $('busyBtn').onclick = function () { busy(false); render(); };
+              } else if (o.state === 'cancel') {
+                busy(false);
+              }
+            };
+
+            // ------------------------------------------------------------ keys
+            var held = {};
+            function key(code, down) {
+              if (!ci) { return; }
+              if (down) {
+                held[code] = (held[code] || 0) + 1;
+                if (held[code] > 1) { return; }
+              } else {
+                if (!held[code]) { return; }
+                held[code]--;
+                if (held[code] > 0) { return; }
+                delete held[code];
+              }
+              try { ci.simulateKeyEvent(code, down); } catch (e) { /* ignore */ }
+            }
+            function releaseAll() {
+              var codes = Object.keys(held), i;
+              for (i = 0; i < codes.length; i++) {
+                try { if (ci) { ci.simulateKeyEvent(parseInt(codes[i], 10), false); } } catch (e) { /* ignore */ }
+              }
+              held = {};
+              setDir({ l: false, r: false, u: false, d: false });
+            }
+            function tap(code) {
+              key(code, true);
+              setTimeout(function () { key(code, false); }, 80);
+            }
+
+            function bindHold(el, codes) {
+              var pid = null;
+              function down(e) {
+                e.preventDefault();
+                if (pid !== null) { return; }
+                pid = e.pointerId;
+                try { el.setPointerCapture(pid); } catch (x) { /* ignore */ }
+                el.classList.add('on');
+                for (var i = 0; i < codes.length; i++) { key(codes[i], true); }
+              }
+              function up(e) {
+                if (e.pointerId !== pid) { return; }
+                pid = null;
+                el.classList.remove('on');
+                for (var i = 0; i < codes.length; i++) { key(codes[i], false); }
+              }
+              el.addEventListener('pointerdown', down);
+              el.addEventListener('pointerup', up);
+              el.addEventListener('pointercancel', up);
+              el.addEventListener('lostpointercapture', up);
+            }
+            function bindTap(el, code) {
+              el.addEventListener('pointerdown', function (e) {
+                e.preventDefault();
+                el.classList.add('on');
+                tap(code);
+                setTimeout(function () { el.classList.remove('on'); }, 150);
+              });
+            }
+
+            // d-pad (8 directions, you can slide the finger around)
+            var dir = { l: false, r: false, u: false, d: false };
+            var dpad = $('dpad'), dpadPtr = null;
+            function setDir(n) {
+              if (n.l !== dir.l) { dir.l = n.l; key(K.LEFT, n.l); $('dL').classList.toggle('on', n.l); }
+              if (n.r !== dir.r) { dir.r = n.r; key(K.RIGHT, n.r); $('dR').classList.toggle('on', n.r); }
+              if (n.u !== dir.u) { dir.u = n.u; key(K.UP, n.u); $('dU').classList.toggle('on', n.u); }
+              if (n.d !== dir.d) { dir.d = n.d; key(K.DOWN, n.d); $('dD').classList.toggle('on', n.d); }
+            }
+            function dpadUpdate(e) {
+              var r = dpad.getBoundingClientRect();
+              var R = r.width / 2;
+              var dx = (e.clientX - (r.left + R)) / R;
+              var dy = (e.clientY - (r.top + R)) / R;
+              setDir({ l: dx < -0.3, r: dx > 0.3, u: dy < -0.3, d: dy > 0.3 });
+            }
+            dpad.addEventListener('pointerdown', function (e) {
+              e.preventDefault();
+              if (dpadPtr !== null) { return; }
+              dpadPtr = e.pointerId;
+              try { dpad.setPointerCapture(dpadPtr); } catch (x) { /* ignore */ }
+              dpadUpdate(e);
+            });
+            dpad.addEventListener('pointermove', function (e) { if (e.pointerId === dpadPtr) { dpadUpdate(e); } });
+            function dpadEnd(e) {
+              if (e.pointerId !== dpadPtr) { return; }
+              dpadPtr = null;
+              setDir({ l: false, r: false, u: false, d: false });
+            }
+            dpad.addEventListener('pointerup', dpadEnd);
+            dpad.addEventListener('pointercancel', dpadEnd);
+            dpad.addEventListener('lostpointercapture', dpadEnd);
+
+            bindHold($('bJump'), [K.CTRL]);
+            bindHold($('bPogo'), [K.ALT]);
+            bindHold($('bSpace'), [K.SPACE]);
+            bindHold($('bFire'), [K.CTRL, K.ALT]);
+            bindTap($('tEsc'), K.ESC);
+            bindTap($('tEnter'), K.ENTER);
+
+            function setCaps(ep) {
+              var fire = $('bFire'), sp = $('bSpace'), po = $('bPogo');
+              fire.classList.toggle('hide', ep > 3);
+              if (ep <= 3) {
+                sp.querySelector('i').textContent = 'Estado';
+                po.querySelector('i').textContent = 'Pogo';
+              } else if (ep <= 6) {
+                sp.querySelector('i').textContent = 'Disparo';
+                po.querySelector('i').textContent = 'Pogo';
+              } else {
+                sp.querySelector('i').textContent = '';
+                po.querySelector('i').textContent = 'Lanzar';
+              }
+            }
+
+            // extra keys in the pause panel
+            (function () {
+              var list = [['Y', K.Y], ['N', K.N], ['F1', K.F1], ['F2', K.F2], ['F3', K.F3], ['ESPACIO', K.SPACE], ['ENTER', K.ENTER]];
+              var cont = $('keys');
+              list.forEach(function (it) {
+                var b = document.createElement('button');
+                b.className = 'tb';
+                b.textContent = it[0];
+                bindTap(b, it[1]);
+                cont.appendChild(b);
+              });
+            })();
+
+            // soft keyboard (for names when saving)
+            var kb = $('kb'), kbOn = false;
+            $('tKb').addEventListener('click', function () {
+              kbOn = !kbOn;
+              $('tKb').classList.toggle('on', kbOn);
+              if (kbOn) {
+                kb.focus();
+                try { window.Android.showKeyboard(true); } catch (e) { /* ignore */ }
+              } else {
+                kb.blur();
+                try { window.Android.showKeyboard(false); } catch (e) { /* ignore */ }
+              }
+            });
+            kb.addEventListener('keydown', function (e) {
+              e.stopPropagation();
+              if (e.key === 'Backspace') { tap(K.BACK); e.preventDefault(); }
+              else if (e.key === 'Enter') { tap(K.ENTER); e.preventDefault(); }
+            });
+            kb.addEventListener('keyup', function (e) { e.stopPropagation(); });
+            kb.addEventListener('input', function () {
+              var v = kb.value.toUpperCase();
+              kb.value = '';
+              var i, delay = 0;
+              for (i = 0; i < v.length; i++) {
+                var code = v.charCodeAt(i);
+                if ((code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code === 32) {
+                  (function (c, d) { setTimeout(function () { tap(c); }, d); })(code, delay);
+                  delay += 110;
+                }
+              }
+            });
+
+            // pause panel
+            function togglePause(force) {
+              var p = $('pause');
+              var open = typeof force === 'boolean' ? force : p.style.display !== 'flex';
+              p.style.display = open ? 'flex' : 'none';
+              releaseAll();
+            }
+            $('tMenu').addEventListener('click', function () { togglePause(true); });
+            $('pResume').addEventListener('click', function () { togglePause(false); });
+            $('pExit').addEventListener('click', function () { exitToMenu(); });
+            $('busyBtn').addEventListener('click', function () { /* replaced per use */ });
+
+            window.__back = function () {
+              if ($('confirm').style.display === 'flex') { $('confirm').style.display = 'none'; return true; }
+              if ($('busy').style.display === 'flex') { return true; }
+              if (screenNow === 'game') { togglePause(); return true; }
+              return false;
+            };
+            document.addEventListener('visibilitychange', function () { if (document.hidden) { releaseAll(); } });
+
+            // ------------------------------------------------------------ game
+            function exitToMenu() {
+              releaseAll();
+              var c = ci;
+              ci = null;
+              $('pause').style.display = 'none';
+              busy(true, 'Guardando y volviendo al men\u00fa...', -1, false);
+              if (c) { try { c.exit(); } catch (e) { /* ignore */ } }
+              setTimeout(function () { location.reload(); }, c ? 1000 : 50);
+            }
+
+            function failGame(e) {
+              var msg = (e && e.message) ? e.message : String(e);
+              busy(true, 'No se pudo iniciar el juego:\n' + msg, -1, true);
+              $('busyBtn').onclick = function () { location.reload(); };
+            }
+
+            function setupGamepad(c) {
+              try {
+                if (window.DosController && typeof window.DosController.Gamepad === 'function') {
+                  window.DosController.Gamepad(c, {
+                    gamepads: [{ keymap: { a: K.CTRL, b: K.ALT, x: K.SPACE, y: K.ENTER, start: K.ESC, back: K.ESC },
+                                 mapArrows: true, stickThreshold: 0.6 }],
+                    scanEvery: 200,
+                    scanOnTick: true
+                  });
+                }
+              } catch (e) { /* the on-screen controls still work */ }
+            }
+
+            function launch(n) {
+              var exe = games[n];
+              if (!exe) { return; }
+              if (typeof window.Dos !== 'function') {
+                toast('No se cargó DOSBox (js-dos). Reinstala la app.');
+                return;
+              }
+              show('game');
+              fit();
+              setCaps(n);
+              busy(true, 'Cargando DOSBox...', 0, false);
+              try {
+                window.Dos(canvas, {
+                  wdosboxUrl: 'jsdos/wdosbox.js',
+                  cycles: 'max',
+                  autolock: false,
+                  onprogress: function (stage, total, loaded) {
+                    var p = total > 0 ? Math.round(loaded * 100 / total) : -1;
+                    busy(true, (stage ? String(stage) : 'Cargando') + '...', p, false);
+                  },
+                  onerror: function (m) { failGame(m); },
+                  log: function () { }
+                }).ready(function (fs, main) {
+                  fs.extract('/games/ep' + n + '.zip', '/keen' + n).then(function () {
+                    busy(true, 'Iniciando ' + EP[n].t + '...', 100, false);
+                    return main(['-c', 'cd keen' + n, '-c', exe]);
+                  }).then(function (c) {
+                    ci = c;
+                    busy(false);
+                    setupGamepad(c);
+                  }).catch(function (e) { failGame(e); });
+                }).catch(function (e) { failGame(e); });
+              } catch (e) {
+                failGame(e);
+              }
+            }
+
+            // ------------------------------------------------------------ start
+            render();
+          })();
+          </script>
+          </body>
+          </html>
+          __KEEN_EOF__
+
+      - name: Descargar DOSBox (js-dos 6.22.60)
+        run: |
+          set -euo pipefail
+          DEST="$GITHUB_WORKSPACE/android/app/src/main/assets/www/jsdos"
+          mkdir -p "$DEST" /tmp/jsdos-pkg
+          cd /tmp/jsdos-pkg
+          if npm pack js-dos@6.22.60 --silent; then
+            tar -xzf js-dos-6.22.60.tgz || true
           fi
-          if [ -n "$MAIN_JAVA" ]; then
-            JAVA_DIR="$(dirname "$MAIN_JAVA")"
-            JPKG="$(grep -m1 '^package ' "$MAIN_JAVA" | sed 's/^package //; s/;.*//' | tr -d '\r ' || true)"
-            if [ -n "$JPKG" ]; then PKG="$JPKG"; fi
-          else
-            JAVA_DIR="project/src"
-            echo "inject: AVISO: no hay MainActivity.java; se usa $JAVA_DIR con paquete $PKG"
-          fi
-          mkdir -p "$JAVA_DIR"
-          sed "s/__PKG__/$PKG/" "$KEEN_TOOLS/ImportActivity.java.tpl" > "$JAVA_DIR/ImportActivity.java"
-
-          # ---------- 2) Manifest: ImportActivity pasa a ser la pantalla de inicio ----------
-          patched=0
-          while IFS= read -r M; do
-            [ -n "$M" ] || continue
-            if grep -q 'MainActivity' "$M"; then
-              python3 "$KEEN_TOOLS/patch_manifest.py" "$M" "$PKG"
-              patched=$((patched + 1))
+          echo "Contenido de dist de js-dos:"
+          ls -la /tmp/jsdos-pkg/package/dist 2>/dev/null | head -n 40 || true
+          for f in js-dos.js wdosbox.js wdosbox.wasm.js; do
+            src="/tmp/jsdos-pkg/package/dist/$f"
+            if [ ! -s "$src" ]; then
+              src="$(find /tmp/jsdos-pkg/package -type f -name "$f" 2>/dev/null | head -n 1 || true)"
             fi
-          done < <(find project -name AndroidManifest.xml -not -path '*/jni/*' -not -path '*/build/*')
-          if [ "$patched" -eq 0 ]; then
-            echo "inject: ERROR: no hay ningun AndroidManifest.xml con MainActivity"
-            find project -name AndroidManifest.xml | head -20
-            exit 1
-          fi
-
-          # ---------- 3) Icono propio (icon.png en la raiz del repo) ----------
-          ICON="$GITHUB_WORKSPACE/icon.png"
-          if [ -f "$ICON" ]; then
-            # 3a) icon.png y iconos de launcher (ic_launcher*.png) ya generados -> tu icono
-            while IFS= read -r I; do
-              [ -n "$I" ] || continue
-              cp --remove-destination "$ICON" "$I"
-              echo "inject: icono propio aplicado en $I"
-            done < <(find project -path '*/res/*' \( -name icon.png -o -name ic_launcher.png -o -name ic_launcher_round.png \) -not -path '*/jni/*' -not -path '*/build/*')
-            # 3b) en cada carpeta res con mipmap-*: garantizar ic_launcher.png y quitar el icono adaptativo (xml),
-            #     que en Android 8+ taparia el PNG
-            while IFS= read -r R; do
-              [ -n "$R" ] || continue
-              if ls -d "$R"/mipmap-* > /dev/null 2>&1; then
-                mkdir -p "$R/mipmap-xxxhdpi"
-                cp --remove-destination "$ICON" "$R/mipmap-xxxhdpi/ic_launcher.png"
-                find "$R" -path '*/mipmap-anydpi*' -name 'ic_launcher*.xml' -print -delete
-                echo "inject: icono de launcher garantizado en $R"
-              fi
-            done < <(find project -type d -name res -not -path '*/jni/*' -not -path '*/build/*')
-          fi
-
-          # ---------- 4) Evitar que build.sh considere el proyecto "desactualizado" ----------
-          if [ -f project/src/Globals.java ]; then touch project/src/Globals.java; fi
-
-          echo "inject OK: java=$JAVA_DIR/ImportActivity.java paquete=$PKG manifests=$patched"
-          INJECT_EOF
-          chmod +x inject.sh
-          ls -la
-
-      - name: Seleccionar app, icono y generar proyecto
-        run: |
-          set -euo pipefail
-          cd cg
-          APPDIR="project/jni/application/$CG_APP"
-          # app seleccionada (enlace relativo, sin barras) y cfg de la raiz apuntando a ella
-          rm -f project/jni/application/src
-          ln -s "$CG_APP" project/jni/application/src
-          rm -f AndroidAppSettings.cfg
-          ln -s "$APPDIR/AndroidAppSettings.cfg" AndroidAppSettings.cfg
-          # Solo arm64-v8a (tu Moto G23): compila mucho mas rapido y evita fallos de ABIs viejas con NDK moderno
-          CFG="$APPDIR/AndroidAppSettings.cfg"
-          if grep -q '^MultiABI=' "$CFG"; then sed -i 's/^MultiABI=.*/MultiABI=arm64-v8a/' "$CFG"; else echo 'MultiABI=arm64-v8a' >> "$CFG"; fi
-          grep -n '^MultiABI=' "$CFG"
-          # icono propio: lo usa changeAppSettings y ademas lo reaplica el inyector
-          if [ -f "$GITHUB_WORKSPACE/icon.png" ]; then
-            rm -f "$APPDIR/icon.png"   # es un enlace al logo del motor: no escribir a traves de el
-            cp "$GITHUB_WORKSPACE/icon.png" "$APPDIR/icon.png"
-            echo "icon.png propio copiado a $APPDIR"
-
-          else
-            echo "AVISO: no hay icon.png en la raiz del repo; se usa el icono por defecto"
-          fi
-          # Envolver changeAppSettings.sh: tras regenerar el proyecto, aplicar el inyector
-          mv changeAppSettings.sh changeAppSettings.orig.sh
-          cat > changeAppSettings.sh <<'WRAP_EOF'
-          #!/bin/sh
-          cd "$(dirname "$0")" || exit 1
-          ./changeAppSettings.orig.sh "$@" || exit $?
-          bash "$KEEN_TOOLS/inject.sh" || exit $?
-          WRAP_EOF
-          chmod +x changeAppSettings.sh changeAppSettings.orig.sh
-          ./changeAppSettings.sh -a
-          echo "--- activities del manifest:"
-          grep -n 'activity' project/AndroidManifest.xml || true
-
-      - name: Compilar
-        run: |
-          set -euo pipefail
-          cd cg
-          echo "--- lineas relevantes de build.sh:"
-          grep -n -i 'changeAppSettings\|gradle\|\.apk\|outputs\|PreBuild' build.sh | head -60 || true
-          touch "$RUNNER_TEMP/antes_de_compilar"
-          ./build.sh debug 2>&1 | tee "$RUNNER_TEMP/build.log"
-
-      - name: Reunir, firmar y verificar APK
-        run: |
-          set -euo pipefail
-          mkdir -p salida
-          {
-            find cg -maxdepth 1 -name '*.apk'
-            find cg/project -path '*/outputs/apk/*' -name '*.apk'
-            find cg/project/bin -maxdepth 1 -name '*.apk' 2>/dev/null || true
-          } | while read -r f; do
-            if [ "$f" -nt "$RUNNER_TEMP/antes_de_compilar" ]; then cp -v "$f" salida/; fi
-          done
-          if ! ls salida/*.apk > /dev/null 2>&1; then
-            echo "No se genero ningun APK nuevo. APKs existentes:"; find cg -name '*.apk' | head -20
-            exit 1
-          fi
-          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)"
-          KS="$HOME/.android/debug.keystore"
-          for f in salida/*.apk; do
-            if "$BT/apksigner" verify "$f" > /dev/null 2>&1; then
-              echo "firma valida: $f"
+            if [ -n "$src" ] && [ -s "$src" ]; then
+              cp "$src" "$DEST/$f"
             else
-              echo "sin firma valida: alineando y firmando con la clave debug: $f"
-              "$BT/zipalign" -p -f 4 "$f" "$f.aligned"
-              "$BT/apksigner" sign --ks "$KS" --ks-pass pass:android --key-pass pass:android \
-                --ks-key-alias androiddebugkey --out "$f.signed" "$f.aligned"
-              mv "$f.signed" "$f"; rm -f "$f.aligned" "$f.signed.idsig" "$f.idsig"
-              "$BT/apksigner" verify "$f"
+              echo "No estaba en el paquete npm; descargando $f desde jsDelivr (js-dos 6.22.60)"
+              curl -fsSL "https://cdn.jsdelivr.net/npm/js-dos@6.22.60/dist/$f" -o "$DEST/$f"
             fi
-            python3 "$KEEN_TOOLS/check_apk.py" "$f"
+            test -s "$DEST/$f" || { echo "ERROR: falta $f"; exit 1; }
           done
-          ls -la salida
+          grep -q "Dos" "$DEST/js-dos.js" || { echo "ERROR: js-dos.js no parece valido"; exit 1; }
+          ls -la "$DEST"
+
+      - name: Icono de la app (icon.png)
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet pillow
+          /tmp/venv/bin/python - <<'__KEEN_PY__'
+          import os
+          from PIL import Image, ImageDraw
+          ws = os.environ["GITHUB_WORKSPACE"]
+          src = os.path.join(ws, "icon.png")
+          if os.path.isfile(src):
+              img = Image.open(src).convert("RGBA")
+              print("Usando icon.png de la raiz del repo:", img.size)
+          else:
+              print("AVISO: no hay icon.png en la raiz del repo; se usa un icono de ejemplo")
+              img = Image.new("RGBA", (512, 512), (0, 0, 170, 255))
+              ImageDraw.Draw(img).ellipse((96, 96, 416, 416), fill=(255, 212, 0, 255))
+          w, h = img.size
+          s = min(w, h)
+          left, top = (w - s) // 2, (h - s) // 2
+          img = img.crop((left, top, left + s, top + s))
+          for name, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+              d = os.path.join(ws, "android", "app", "src", "main", "res", "mipmap-" + name)
+              os.makedirs(d, exist_ok=True)
+              img.resize((size, size), Image.LANCZOS).save(os.path.join(d, "ic_launcher.png"))
+          print("Iconos generados")
+          __KEEN_PY__
+
+      - name: Licencias del SDK de Android
+        run: |
+          yes | "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          echo "Licencias del SDK procesadas"
+
+      - name: Instalar Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        working-directory: android
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Preparar APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/CommanderKeen.apk
+          ls -la dist
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
-          name: commander-keen-apk
-          path: salida/*.apk
+          name: CommanderKeen-APK
+          path: dist/CommanderKeen.apk
           if-no-files-found: error
-
-      - name: Diagnostico (solo si falla)
-        if: failure()
-        run: |
-          cd cg || exit 0
-          echo "=== NDK ==="; echo "$ANDROID_NDK_HOME"; ls "$ANDROID_HOME/ndk" || true
-          echo "=== Submodulos descargados ==="; git submodule status | grep -v '^-' | head -30 || true
-          echo "=== App ==="; ls -la "project/jni/application/$CG_APP" || true
-          echo "=== project/src ==="; ls project/src 2>/dev/null | head -60 || true
-          echo "=== ImportActivity ==="; find project -name ImportActivity.java -not -path '*/jni/*' || true
-          echo "=== Manifests ==="; find project -name AndroidManifest.xml -not -path '*/jni/*' || true
-          echo "=== project/AndroidManifest.xml ==="; sed -n '1,80p' project/AndroidManifest.xml 2>/dev/null || true
-          echo "=== Wrapper ==="; head -5 changeAppSettings.sh || true
-          echo "=== APKs ==="; find . -name '*.apk' -not -path '*/hid-pc-keyboard/*' | head || true
-          echo "=== cfg: AppCflags / librerias ==="; grep -n '^AppCflags=\|^CompiledLibraries=\|^AppLibraries=\|^MultiABI=' "project/jni/application/$CG_APP/AndroidAppSettings.cfg" || true
-          echo "=== Boost ==="; echo "CPLUS_INCLUDE_PATH=${CPLUS_INCLUDE_PATH:-sin definir}"; ls -la "${KEEN_BOOST_INC:-/nonexistent}" 2>/dev/null || true
-          echo "=== OpenSSL: parches rechazados (.rej) ==="
-          find project/jni/openssl -name '*.rej' 2>/dev/null | while read -r f; do echo "--- $f"; cat "$f"; done || true
-          echo "=== Ultimas lineas del build ==="; tail -n 80 "$RUNNER_TEMP/build.log" 2>/dev/null || true
